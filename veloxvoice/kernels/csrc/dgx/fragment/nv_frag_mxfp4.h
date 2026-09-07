@@ -1,19 +1,17 @@
-/* VeloxVoice — DGX-Spark (sm_121a) warp-level nvfp4/mxfp4 fragments (Apache-2.0).
- *
- * Lineage: flash-float-jit-kernels fragment/nv_frag_gemm_scaled_impl.h (Hopper
- * symmetric fragment semantics) + secYOUre/nvfp4bench gemm_warp_mxf4.cu for the
- * m16n8k64 mxf4nvf4.block_scale row.col register mapping:
- *   g=lane>>2, t=lane&3 ; A row=2g+((p>>3)&1), k=16t+8*((p>>3)>>1)+(p&7)
- *   B col=g, k=16t+p ; D m=2g+(dreg>>1), n=2t+(dreg&1)
+/* VeloxVoice — DGX-Spark (sm_121a) warp-level nvfp4/mxfp4 fragments. */
+
+/* ref to SM100 implementation https://github.com/Avarok-Cybersecurity/dgx-vllm/blob/main/cutlass_nvfp4/nvfp4_gemm_kernel_optimized.cuh */
+
+/* ret to SM121a mma instruction https://github.com/ggml-org/llama.cpp/blob/8fe90e1fbfc065f17a0b233c9df239423cd24a75/ggml/src/ggml-cuda/mma.cuh#L1126
+ * Note our gemm implements standard wasp workload and extensively use TMA (NoC) for data loading.
  */
+
 #pragma once
 
 #include <cstdint>
 
 namespace xpu {
 
-// one m16n8k64 packed mxf4nvf4 MMA: A = 4x uint32 packed e2m1 (16 codes), B = 2x uint32
-// packed e2m1 (16 codes), D = 4x float. Scales: ue8m0 2X unit (legacy 1.0 default).
 __device__ inline void mxfp4_mma(float acc[4], const uint32_t a[4], const uint32_t b[2],
                                  uint32_t scale_a = 0x00007F7Fu,
                                  uint32_t scale_b = 0x00007F7Fu) {

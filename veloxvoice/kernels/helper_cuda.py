@@ -7,6 +7,7 @@ opt flags; arch string is part of every kernel cache key.
 from __future__ import annotations
 
 
+# TODO (yiakwy) : remove, prefer _is_cuda variable
 def cuda_available() -> bool:
     try:
         import torch
@@ -16,6 +17,7 @@ def cuda_available() -> bool:
         return False
 
 
+# TODO (yiakwy) : remove, prefer ARCH variable
 def compute_capability(device: int = 0) -> tuple[int, int]:
     import torch
 

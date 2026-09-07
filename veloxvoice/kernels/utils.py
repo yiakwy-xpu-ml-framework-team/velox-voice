@@ -58,11 +58,13 @@ def build_cuda_module(
     else:
         flags = cuda_build_flags() + list(extra_cuda_cflags)
         arch = helper_cuda.cuda_arch_str()
+
     key = source_key(name, list(sources), flags, arch)
     build_dir = BUILD_CACHE / f"{name}-{key}"
     build_dir.mkdir(parents=True, exist_ok=True)
 
     prev = os.environ.get("TVM_FFI_CUDA_ARCH_LIST")
+
     if arch_override:
         os.environ["TVM_FFI_CUDA_ARCH_LIST"] = arch
     try:

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from .features import log_floor, mel_filterbank, povey_window
 
 
@@ -35,9 +37,8 @@ class _FrameBookkeeping:
 
 class TorchGpuFrontend:
     def __init__(self, cfg: FrontendConfig, device: str = "cuda:0"):
-        import torch
 
-        self.torch = torch
+        self.backend = torch
         self.cfg = cfg
         self.device = device
         c = cfg
@@ -56,16 +57,16 @@ class TorchGpuFrontend:
 
     def _preemph(self, pcm):
         """pcm: 1-D device tensor. Prepends tail sample so the filter is seamless."""
-        x = self.torch.cat([self._tail, pcm])
+        x = self.backend.cat([self._tail, pcm])
         y = x[1:] - self.cfg.preemph * x[:-1]
         self._tail = pcm[-1:]
         return y
 
     def _frames_to_fbank(self, frames):
         """frames: [T, fl] device."""
-        t = self.torch
+        backend = self.backend
         win = frames * self.window
-        spec = t.fft.rfft(win, n=self.n_fft)  # [T, F] complex
+        spec = backend.fft.rfft(win, n=self.n_fft)  # [T, F] complex
         if self.device.startswith("cuda"):
             from veloxvoice.kernels.ops import power_mel_log
 
@@ -74,7 +75,7 @@ class TorchGpuFrontend:
             )
         power = spec.real**2 + spec.imag**2
         feat = power @ self.mel.T  # [T, M]
-        feat = t.log(t.clamp_min(feat, float(1.1920929e-7)))
+        feat = backend.log(backend.clamp_min(feat, float(1.1920929e-7)))
         if self.cfg.cmvn_mean is not None:
             feat = (feat - self.cfg.cmvn_mean) * self.cfg.cmvn_istd
         return feat
@@ -82,12 +83,12 @@ class TorchGpuFrontend:
     def accept(self, pcm) -> "object":
         """Accept new 16-bit-normalized PCM (numpy or torch), return new fbank
         frames [T_new, n_mel] on device (may be empty)."""
-        t = self.torch
-        if not isinstance(pcm, t.Tensor):
-            pcm = t.as_tensor(pcm, dtype=t.float32)
+        backend = self.backend
+        if not isinstance(pcm, backend.Tensor):
+            pcm = backend.as_tensor(pcm, dtype=backend.float32)
         pcm = pcm.to(self.device) * 32768.0  # kaldi/WeNet int16 scaling
         y = self._preemph(pcm)
-        self._buf = t.cat([self._buf, y])
+        self._buf = backend.cat([self._buf, y])
 
         n = self._book.n_complete(int(self._buf.shape[0]))
         if n == 0:
@@ -99,12 +100,12 @@ class TorchGpuFrontend:
 
     def flush(self) -> "object":
         """Flush trailing partial frame (zero-padded to frame_length)."""
-        t = self.torch
+        backend = self.backend
         r = int(self._buf.shape[0])
         if r < max(1, self.fs):
             return self._buf.new_zeros((0, self.cfg.num_mel_bins))
         pad = self.fl + self.fs - r  # one extra frame
-        padded = t.cat([self._buf, t.zeros(pad, device=self.device)])
+        padded = backend.cat([self._buf, backend.zeros(pad, device=self.device)])
         frames = padded[: (0) * self.fs + self.fl][None, :]  # single frame
         self._buf = self._buf.new_zeros(0)
         return self._frames_to_fbank(frames)

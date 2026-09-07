@@ -23,23 +23,28 @@ class CtcGreedyDecoder:
         """Feed the argmax ids of one chunk; returns newly emitted token ids."""
         new: list[int] = []
         last = self._last
-        for t in ids:
-            t = int(t)
-            if t != last and t != self.blank:
-                new.append(t)
-            last = t
+        for tok in ids:
+            tok = int(tok)
+            if tok != last and tok != self.blank:
+                new.append(tok)
+            last = tok
         self._last = last
         self.tokens.extend(new)
         return new
 
     # TODO (yiakwy) : move to gpu
     def push_logp(self, logp):
+        import torch as backend
+
         ids = logp.argmax(-1)
-        ids = (
-            ids.reshape(-1).tolist()
-            if not hasattr(ids, "astype")
-            else [int(i) for i in ids.reshape(-1).tolist()]
-        )
+        if backend.is_tensor(ids):
+            if ids.ndim == 1:
+                prev = backend.cat([ids.new_zeros(1), ids[:-1]])
+                keep = ((ids != self.blank) & (ids != prev)).nonzero().squeeze(-1)
+                kept = ids[keep]
+                ids = kept.cpu().tolist()
+            else:
+                ids = ids.cpu().tolist()
         return self.push_ids(ids)
 
 

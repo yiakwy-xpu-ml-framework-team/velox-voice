@@ -2,8 +2,8 @@
 Enable velox JIT kernel (fused_layernorm + silu_glu) with --use-jit / --no-jit.
 
 Usage:
-  python tools/bench_mirror.py \
-    --model-dir <含 final.pt 的 bundle 目录> (--use-jit | --no-jit) [--iters N]
+  python tools/bench_wenet.py \
+    --model-dir <bundle with final.pt> --audio <audio with supported suffix> [--seconds N] [--use-jit | --no-jit] [--iters N]
 """
 
 from __future__ import annotations
@@ -81,6 +81,7 @@ def read_trans(dirpath):
     return refs
 
 
+# TODO (yiakwy) : replaced with cer
 def wer(ref, hyp):
     r, h = ref.split(), hyp.split()
     n = len(r)
@@ -137,7 +138,8 @@ def verify_correctness(fe, args, suffix=".wav"):
             f"n={len(d_on.tokens)}"
         )
         assert same_tokens, "velox JIT kernel deviated."
-    pass
+    else:
+        raise Exception("No valid audio file")
 
 
 def main():
@@ -217,10 +219,10 @@ def main():
 
         dec = CtcGreedyDecoder()
         dec.push_logp(logp)
-        elapsed_dec_1 = time.perf_counter() - start_dec
+        elapsed_dec_ctc = time.perf_counter() - start_dec
 
         txt = text_tok.ids_to_text(dec.tokens).strip().lower()
-        elapsed_dec_2 = time.perf_counter() - start_dec
+        elapsed_dec_tokens = time.perf_counter() - start_dec
 
         late_wall = time.perf_counter() - start
 
@@ -241,7 +243,7 @@ def main():
 
         print(
             f"[{name}] {t_audio:6.2f}s enc={enc_elapsed *1e3:8.2f}ms, late_wall={late_wall *1e3:8.2f} "
-            f"total rtf={total_rtf:.4f}, encoder rtf={enc_rtf:.4f} (+ctc={(elapsed_dec_1 + elapsed_dec_2)*1e3:4.1f}ms){wer_txt}"
+            f"total rtf={total_rtf:.4f}, encoder rtf={enc_rtf:.4f} (+ctc={(elapsed_dec_ctc + elapsed_dec_tokens)*1e3:4.1f}ms){wer_txt}"
         )
         print("  hyp:", txt)
         if ref:

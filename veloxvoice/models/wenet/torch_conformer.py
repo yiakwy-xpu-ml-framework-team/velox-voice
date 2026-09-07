@@ -42,6 +42,41 @@ class DenseLinear(nn.Linear):
             self.weight.copy_(w)
             if b is not None:
                 self.bias.copy_(b)
+        self.precision = os.environ.get("VELOXVOICE_ASR_PRECISION", "fp32")
+
+    def forward(self, x):
+        if getattr(self, "precision", "fp32") == "nvfp4":
+            orig_shape = x.shape
+            if x.dim() == 3:
+                x = x.reshape(-1, orig_shape[-1])
+            from veloxvoice.kernels.ops import dgx_mxfp4_gemm
+            from veloxvoice.models.wenet.mxfp4_linear import (
+                CODE_16,
+                _encode_codes,
+                _pad16,
+                pack_codes,
+            )
+
+            absmax = self.weight.detach().abs().max().clamp(1e-6)
+            w_scale = absmax / CODE_16
+            codes_w = pack_codes(
+                _encode_codes(_pad16(self.weight.detach(), 128) / w_scale)
+            )
+            x_scale = x.detach().abs().max().clamp(1e-6) / CODE_16
+            codes_x = pack_codes(_encode_codes(_pad16(x, 128) / x_scale))
+            out = dgx_mxfp4_gemm(
+                codes_x,
+                codes_w,
+                torch.full((codes_w.shape[1],), 127, device="cuda", dtype=torch.uint8),
+                torch.full((codes_w.shape[1],), 127, device="cuda", dtype=torch.uint8),
+            )
+            out = out[: x.shape[0], : self.out_features] * x_scale * w_scale
+            if self.bias is not None:
+                out = out + self.bias
+            if len(orig_shape) == 3:
+                out = out.view(orig_shape[0], orig_shape[1], -1)
+            return out
+        return torch.nn.functional.linear(x, self.weight, self.bias)
 
 
 class WenetConformerEmbed(nn.Module):
@@ -147,8 +182,8 @@ def _jit_ln(x, w, b, eps):
     if x.is_cuda and _ASR_USE_JIT:
         from veloxvoice.kernels.ops import fused_layernorm
 
-        t, d = x.shape[0] * x.shape[1], x.shape[-1]
-        return fused_layernorm(x.view(t, d).contiguous(), w, b, eps).view_as(x)
+        d = x.shape[-1]
+        return fused_layernorm(x.reshape(-1, d).contiguous(), w, b, eps).view_as(x)
     return torch.nn.functional.layer_norm(x, (x.shape[-1],), w, b, eps)
 
 
@@ -179,7 +214,8 @@ class WenetConformerConvModule(nn.Module):
             self.pw2.bias.copy_(states[p + "pointwise_conv2.bias"])
 
     def forward(self, x, mask_pad, cnn_cache=None):
-        if _ASR_USE_JIT and x.is_cuda:
+        # fp16 开时回退到 torch native (autocast 自动半位化); velox silu_glu 只有 fp32 路径
+        if _ASR_USE_JIT and x.is_cuda and x.dtype == torch.float32:
             from veloxvoice.kernels.ops import silu_glu
 
             if getattr(self, "_pwlin", None) is None:
@@ -340,6 +376,11 @@ class WenetConformerASR:
         for L in self.encoder.layers:
             L.conv._pwlin = None
 
+    def set_fp16(self, on: bool):
+        """A2 ablation: autocast-cuda fp16 for the encoder (weights unchanged).
+        autocast 处理: Linear/Conv/matmul → fp16.accum; LN/softmax/LayerNorm → fp32 同路."""
+        self.fp16_mode = bool(on)
+
     @property
     def embeds_cmvn(self) -> bool:
         return True
@@ -349,6 +390,14 @@ class WenetConformerASR:
         return int(self.encoder.embed.pos_pe.shape[1])
 
     def encode_utterance(self, feats):
+        autocast = getattr(self.backend, "autocast", None)
+        if autocast and getattr(self, "fp16_mode", False):
+            with (
+                self.backend.inference_mode(),
+                autocast(device_type="cuda", dtype=torch.float16),
+            ):
+                x = (feats - self.global_cmvn_mean) * self.global_cmvn_istd
+                return self.encoder(x)
         with self.backend.inference_mode():
             x = (feats - self.global_cmvn_mean) * self.global_cmvn_istd
             return self.encoder(x)
