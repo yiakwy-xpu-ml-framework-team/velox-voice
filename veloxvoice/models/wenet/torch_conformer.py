@@ -183,14 +183,24 @@ class WenetConformerAttention(nn.Module):
         n_pos = pos_emb.shape[0]
         p = self.lp(pos_emb).view(n_pos, -1, self.h, self.dk)
         p0 = p.transpose(1, 2)
-        qu = (q.transpose(1, 2) + self.pos_u).transpose(1, 2)
-        qv = (q.transpose(1, 2) + self.pos_v).transpose(1, 2)
-        mac = qu @ k.transpose(-2, -1)
-        mbd = qv @ p0.transpose(-2, -1)
-        scores = (mac + mbd) / math.sqrt(self.dk)
-        scores = scores + mask
-        attn = torch.softmax(scores, dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(n, -1, self.d)
+
+        # Fold 1/sqrt(dk) into q so SDPA can run with scale=1 and the rel-pos
+        # term becomes part of the additive mask — this lets
+        # scaled_dot_product_attention fuse QK^T + bias + softmax + PV into
+        # one memory-efficient kernel (the composed form spends more time in
+        # broadcast add/div/softmax on [1,h,T,T] tensors than in the bmm's).
+        scale = 1.0 / math.sqrt(self.dk)
+        pos_u = self.pos_u.view(1, self.h, 1, self.dk)
+        pos_v = self.pos_v.view(1, self.h, 1, self.dk)
+        qu_s = (q + pos_u) * scale
+        qv_s = (q + pos_v) * scale
+        mbd = qv_s @ p0.transpose(-2, -1)  # [1, h, Tc, Tc], pre-scaled
+        attn_mask = mbd + mask if mask is not None else mbd
+
+        x = torch.nn.functional.scaled_dot_product_attention(
+            qu_s, k, v, attn_mask=attn_mask, scale=1.0
+        )
+        x = x.transpose(1, 2).reshape(n, -1, self.d)
         return self.lo(x), None
 
 
@@ -206,7 +216,9 @@ def asr_set_jit(on: bool):
 
 
 def _jit_ln(x, w, b, eps):
-    if x.is_cuda and _ASR_USE_JIT:
+    # fused_layernorm is an fp32 kernel: it would reinterpret a bf16/fp16
+    # buffer as float* under autocast — guard on dtype like the conv path.
+    if x.is_cuda and _ASR_USE_JIT and x.dtype == torch.float32:
         from veloxvoice.kernels.ops import fused_layernorm
 
         d = x.shape[-1]
@@ -253,6 +265,10 @@ class WenetConformerConvModule(nn.Module):
                     self._pwlin.weight.copy_(self.cv1.weight.squeeze(-1))
                     self._pwlin.bias.copy_(self.cv1.bias)
             g = self._pwlin(x)  # [B, T, C]
+            if g.dtype != torch.float32:
+                # autocast may return bf16/fp16 even when x is fp32; silu_glu
+                # is an fp32 kernel and would reinterpret the buffer.
+                g = g.float()
 
             # NOTE (yiakwy) : optimize
             sg = silu_glu(g.squeeze(0).contiguous()).unsqueeze(0)  # [B, T, C]
@@ -318,14 +334,10 @@ class WenetConformerLayer(nn.Module):
 
     def forward(self, x, mask, pos_emb, _):
         x = x + self.ff_scale * self.ff_macaron(self._N(self.norm_ff_macaron, x))
-        x = (
-            x
-            + self.attn(
-                self._N(self.norm_mha, x),
-                torch.zeros(1, x.shape[1], x.shape[1], dtype=x.dtype, device=x.device),
-                pos_emb,
-            )[0]
-        )
+        # mask=None (offline full-context path): pass through so the attention
+        # skips the additive mask entirely. Allocating a zeros [1,T,T] here
+        # cost a memset + a full [1,h,T,T] broadcast add per layer per chunk.
+        x = x + self.attn(self._N(self.norm_mha, x), mask, pos_emb)[0]
         x = x + self.conv(self._N(self.norm_conv, x), None)[0]
         x = x + self.ff_scale * self.ff(self._N(self.norm_ff, x))
         return self._N(self.norm_final, x)
@@ -359,6 +371,12 @@ class WenetConformerASR:
     ):
         # NOTE (yiakwy) : torch, mlx backends
         self.backend = torch
+
+        # Tensor-core fp32 (tf32) matmul: cuDNN convs already run tf32 by
+        # default; leaving matmul at ieee pins every Linear/bmm to SIMT fp32
+        # (~8x slower than tf32 tensor cores on GB10).
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
         # NOTE (yiakwy) : targeted devices include cpu, nvgpu (amdgpu) and mlx (mps)
         self.device = device
@@ -415,11 +433,17 @@ class WenetConformerASR:
         mxfp4: weight pre-quantized once, activation online quantized per call.
         nvfp4: per-matrix absolute-max quantization, smart dispatch.
         """
-        for module in self.modules():
+        # WenetConformerASR is not an nn.Module; the DenseLinear layers live in
+        # self.encoder (module tree) and self.ctc_lo (a DenseLinear itself).
+        for module in self.encoder.modules():
             if isinstance(module, DenseLinear):
                 module.precision = precision
                 if precision in ("nvfp4", "mxfp4"):
                     module._prequantize_weight(precision)
+
+        self.ctc_lo.precision = precision
+        if precision in ("nvfp4", "mxfp4"):
+            self.ctc_lo._prequantize_weight(precision)
 
     @property
     def embeds_cmvn(self) -> bool:

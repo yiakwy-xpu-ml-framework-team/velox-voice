@@ -29,37 +29,42 @@ __global__ void RelPosScoresKernel(const float* __restrict__ q_u,
                                    float* __restrict__ probs,
                                    int H, int Tq, int L, int DK, int SPAN,
                                    float inv_sqrt_dk) {
-  // one block per (h, i); threads iterate j, compute dot over DK
+  // one block per (h, i); one WARP per j (lanes walk d coalesced, shfl reduce)
   int h = blockIdx.y;
   int i = blockIdx.x;
-  const float* q_u_i = q_u + ((h * Tq + i) * DK);
-  const float* q_v_i = q_v + ((h * Tq + i) * DK);
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int nwarp = blockDim.x >> 5;  // BLOCK_X / 32
+  const float* q_u_i = q_u + ((long)(h * Tq + i)) * DK;
+  const float* q_v_i = q_v + ((long)(h * Tq + i)) * DK;
   int vcnt = valid[h * Tq + i];       // number of usable k slots for this (h, i)
   __shared__ float sh_scores[MAX_L];  // L <= MAX_L asserted by launcher
   __shared__ float sh_red[BLOCK_X / 32];
 
-  float best = -1e30f;
-  for (int j = threadIdx.x; j < L; j += BLOCK_X) {
-    float s;
+  for (int j = warp; j < L; j += nwarp) {
+    float s = -1e30f;
     if (j >= L - vcnt) {  // usable = the LAST vcnt slots of the L-window
-      const float* k_j = k + ((h * L + j) * DK);
+      const float* k_j = k + ((long)(h * L + j)) * DK;
       const float* p_ij = pe + ((long)idx[i * L + j] * (H * DK)) + (long)h * DK;
       float ac = 0.f, bd = 0.f;
-#pragma unroll 4
-      for (int d = 0; d < DK; ++d) {
+      for (int d = lane; d < DK; d += 32) {  // lanes contiguous -> coalesced
         ac += q_u_i[d] * k_j[d];
         bd += q_v_i[d] * p_ij[d];
       }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        ac += __shfl_down_sync(0xffffffffu, ac, off);
+        bd += __shfl_down_sync(0xffffffffu, bd, off);
+      }
       s = (ac + bd) * inv_sqrt_dk;
-    } else {
-      s = -1e30f;
     }
-    sh_scores[j] = s;
-    best = fmaxf(best, s);
+    if (lane == 0) sh_scores[j] = s;
   }
+  __syncthreads();
+  float best = -1e30f;
+  for (int j = threadIdx.x; j < L; j += BLOCK_X) best = fmaxf(best, sh_scores[j]);
   // block reduce max
   for (int off = 16; off > 0; off >>= 1) best = fmaxf(best, __shfl_down_sync(0xffffffffu, best, off));
-  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   if (lane == 0) sh_red[warp] = best;
   __syncthreads();
   if (warp == 0) {

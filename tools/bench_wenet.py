@@ -211,7 +211,7 @@ def main():
         pcm = read_audio(path)
         if args.seconds:
             pcm = pcm[: int(args.seconds * 16000)]
-        t_audio = len(pcm) / 16000.0
+        audio_dur = len(pcm) / 16000.0
 
         # extract features
         feats = torch.cat([fe.accept(pcm), fe.flush()], dim=0)
@@ -245,8 +245,8 @@ def main():
             tot_w += n
             wer_txt = f" err={e}" + (" (EXACT)" if e == 0 else "")
 
-        enc_rtf = enc_elapsed / t_audio
-        total_rtf = late_wall / t_audio
+        enc_rtf = enc_elapsed / audio_dur
+        total_rtf = late_wall / audio_dur
 
         elapse_enc_list.append(enc_elapsed)
         enc_rtf_list.append(enc_rtf)
@@ -254,7 +254,7 @@ def main():
         tot_wall += late_wall
 
         print(
-            f"[{name}] {t_audio:6.2f}s enc={enc_elapsed *1e3:8.2f}ms, late_wall={late_wall *1e3:8.2f} "
+            f"[{name}] {audio_dur:6.2f}s enc={enc_elapsed *1e3:8.2f}ms, late_wall={late_wall *1e3:8.2f} "
             f"total rtf={total_rtf:.4f}, encoder rtf={enc_rtf:.4f} (+ctc={(elapsed_dec_ctc + elapsed_dec_tokens)*1e3:4.1f}ms){wer_txt}"
         )
         print("  hyp:", txt)

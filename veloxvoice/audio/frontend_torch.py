@@ -98,6 +98,8 @@ class TorchGpuFrontend:
             if precision == "mxfp4" and self._mel_codes is not None:
                 from veloxvoice.kernels.ops import power_mel_log_mxfp4
 
+                # GEMM works on M_padded=128 columns; slice back to the model's
+                # num_mel_bins (padded columns are garbage from zero-power rows).
                 return power_mel_log_mxfp4(
                     spec.contiguous(),
                     self._mel_codes,
@@ -106,7 +108,7 @@ class TorchGpuFrontend:
                     self.cfg.cmvn_istd,
                     self._F_padded,
                     self._M_padded,
-                )
+                )[:, : self.cfg.num_mel_bins]
             else:
                 from veloxvoice.kernels.ops import power_mel_log
 

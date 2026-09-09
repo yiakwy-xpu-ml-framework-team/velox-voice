@@ -48,13 +48,52 @@ def _conv_mod():
     )
 
 
+_power_mel_log_mel_cache = {}
+_power_mel_log_zeros = {}
+
+
+def _get_padded_mel(mel, F_padded):
+    """mel [M, F] -> [F_padded, M] (transposed + zero-padded), cached per tensor.
+
+    The mel filterbank is a static per-model buffer; padding it on every call
+    costs ~2 extra dispatches + allocations per chunk.
+    """
+    import weakref
+
+    import torch
+
+    key = weakref.ref(mel)
+    meta = (F_padded, tuple(mel.shape), mel.dtype, mel.device)
+    ent = _power_mel_log_mel_cache.get(key)
+    if ent is not None and ent[0] == meta:
+        return ent[1]
+    M, F = mel.shape
+    mel_g = torch.zeros(F_padded, M, device=mel.device, dtype=mel.dtype)
+    mel_g[:F, :M] = mel.t()  # [F, M] -> pad to [F_padded, M]
+    if len(_power_mel_log_mel_cache) > 8:
+        _power_mel_log_mel_cache.clear()
+    _power_mel_log_mel_cache[key] = (meta, mel_g)
+    return mel_g
+
+
+def _zero_vec(n, device, dtype):
+    import torch
+
+    key = (str(device), dtype, n)
+    z = _power_mel_log_zeros.get(key)
+    if z is None:
+        z = torch.zeros(n, device=device, dtype=dtype)
+        _power_mel_log_zeros[key] = z
+    return z
+
+
 def power_mel_log(spec, mel, cmvn_mean, cmvn_istd):
     """spec [T,F] complex (torch.fft.rfft output, interleaved storage), mel [M,F]
     -> out [T,M]. cmvn_mean/istd: [M] tensors or None.
 
     Dispatch:
-      - M <= 80 AND T >= 64: CUDA fused TMA pipeline (tf32 persistent GEMM)
-      - Otherwise: cuBLAS GEMM (power→matmul→log)
+      - M <= 80 AND T >= 64: CUDA fused TF32 MMA pipeline (persistent GEMM)
+      - Otherwise: cuBLAS GEMM (power -> matmul -> log)
     """
     import torch
 
@@ -67,31 +106,25 @@ def power_mel_log(spec, mel, cmvn_mean, cmvn_istd):
     if (F_padded // BK) % 2 != 0:
         F_padded += BK
 
-    # Fused TMA kernel path: M <= BN=80 AND T >= BM=64
+    # Fused MMA kernel path: M <= BN=80 AND T >= BM=64
     if M <= BN and T >= BM:
-        BK, BM, BN = 64, 64, 80
-        F_padded = ((F + BK - 1) // BK) * BK
-        if (F_padded // BK) % 2 != 0:
-            F_padded += BK
-
         # mel_g must be [F_padded, M] for kernel: mel_g[f * M + n]
-        # Original mel is [M, F], transpose to [F, M], pad to [F_padded, M]
-        mel_g = torch.zeros(F_padded, M, device=mel.device, dtype=mel.dtype)
-        mel_g[:F, :M] = mel.t()  # [F, M] → pad to [F_padded, M]
+        mel_g = _get_padded_mel(mel, F_padded)
 
         out = torch.empty(T, M, device=spec.device, dtype=torch.float32)
-        zero = torch.zeros(M, device=mel.device, dtype=mel.dtype)
         has = 1 if cmvn_mean is not None else 0
         with tvm_ffi.use_torch_stream():
             _audio_mod().power_log_bf16(
                 spec.contiguous(),
                 mel_g,
-                cmvn_mean if has else zero,
-                cmvn_istd if has else zero,
+                cmvn_mean if has else _zero_vec(M, mel.device, mel.dtype),
+                cmvn_istd if has else _zero_vec(M, mel.device, mel.dtype),
                 out,
                 has,
             )
         return out
+
+    return _power_mel_log_cublas(spec, mel, cmvn_mean, cmvn_istd)
 
 
 def _power_mel_log_cublas(spec, mel, cmvn_mean, cmvn_istd):
@@ -128,21 +161,28 @@ def power_mel_log_mxfp4(
     # Step 1: Compute power (re² + im²) — online, not pre-quantized
     power = spec.real**2 + spec.imag**2  # [T, F]
 
-    # Step 2: Quantize power activations (online quantize A)
-    power_padded = torch.zeros(T, F_padded, device=spec.device, dtype=power.dtype)
-    power_padded[:, :F] = power
+    # Step 2: Quantize power activations (online quantize A).
+    # The blkscale GEMM requires rows (M) padded to K_BM=128 and F padded
+    # to a multiple of 64; zero rows produce zero power (sliced away below).
+    K_BM = 128
+    T_padded = ((T + K_BM - 1) // K_BM) * K_BM
+    power_padded = torch.zeros(
+        T_padded, F_padded, device=spec.device, dtype=power.dtype
+    )
+    power_padded[:T, :F] = power
     a_codes, a_scales = mxfp4_block_quantize(power_padded, mode="A")
 
     # Step 3: GEMM via mxfp4 block-scale kernel
     out_padded = dgx_mxfp4_blkscale_gemm(a_codes, mel_codes, a_scales, mel_scales)
 
-    # Step 4: Log + CMVN
+    # Step 4: Log + CMVN (CMVN width defines the valid mel columns)
+    M_valid = cmvn_mean.shape[0] if cmvn_mean is not None else M_padded
+    out_padded = out_padded[:T, :M_valid]
     out_padded = torch.log(torch.clamp_min(out_padded, 1.1920929e-7))
     if cmvn_mean is not None and cmvn_istd is not None:
         out_padded = (out_padded - cmvn_mean.unsqueeze(0)) * cmvn_istd.unsqueeze(0)
 
-    # Slice to valid M columns
-    return out_padded[:, :M_padded]
+    return out_padded
 
 
 def reference_power_mel_log(re, im, mel, cmvn_mean, cmvn_istd):

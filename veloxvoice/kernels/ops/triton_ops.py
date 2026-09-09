@@ -37,13 +37,18 @@ def _per_row_col_quantize_kernel(
     local_max = tl.maximum(abs_even, abs_odd)
     row_max = tl.max(local_max, axis=0)
 
-    # NOTE (yiakwy) : clamp per row/col max to fp4 range
+    # NOTE (yiakwy) : clamp per row/col max to fp4 range.
+    # The stored scale must be the EXACT power of two used for normalization
+    # (kernel decodes ue8m0 = 2^(e-127)); ceil keeps scale >= row_max/6 so
+    # codes never saturate the e2m1 range.
     s = row_max / 6.0
     s_safe = tl.maximum(s, 1e-6)
+    e = tl.ceil(tl.log2(s_safe))
+    scale = tl.exp2(e)
 
-    # Normalize
-    n_even = even / s_safe
-    n_odd = odd / s_safe
+    # Normalize by the stored scale
+    n_even = even / scale
+    n_odd = odd / scale
 
     ax_even = tl.abs(n_even)
     ax_odd = tl.abs(n_odd)
@@ -78,14 +83,10 @@ def _per_row_col_quantize_kernel(
     packed = c_even | (c_odd << 4)
     tl.store(OutQ + pid * stride_q_m + cols * stride_q_k, packed, mask=mask)
 
-    # Per-row scale as ue8m0 (trunc log2 + 127 bias)
-    safe_s = tl.maximum(s, 1e-20)
-    log2x = tl.log2(safe_s)
-    truncated = tl.where(log2x >= 0, tl.floor(log2x), tl.ceil(log2x))
-    e = tl.clamp(truncated + 127.0, 0.0, 255.0).to(tl.uint8)
-    e = tl.where(s > 1e-20, e, 0x80).to(tl.uint8)
+    # Per-row scale as ue8m0 (e + 127 bias); decode = 2^e == normalization scale
+    e_byte = tl.clamp(e + 127.0, 0.0, 255.0).to(tl.uint8)
 
-    tl.store(OutS + pid, e)
+    tl.store(OutS + pid, e_byte)
 
 
 def per_row_col_quantize(w, block_size=None):
@@ -225,10 +226,16 @@ def _mxfp4_quantize_kernel(
         b_n_o = a_e
 
     # Per 16-col block absmax: one block = 8 e/o pairs -> grid [K/16, 8]
+    # Stored scale = 2^ceil(log2(block_max/6)) >= block_max/6 (no saturation);
+    # codes are normalized by that exact power of two so decode == encode.
     ab = tl.reshape(am, (BLOCK_KP2 // 8, 8))
     bs = tl.max(ab, axis=1) / 6.0  # [K/16] block scales
     bs = tl.maximum(bs, 1e-6)
-    bcols = tl.reshape(tl.broadcast_to(bs[:, None], (BLOCK_KP2 // 8, 8)), (BLOCK_KP2,))
+    e_blk = tl.ceil(tl.log2(bs))  # [K/16]
+    scale_blk = tl.exp2(e_blk)
+    bcols = tl.reshape(
+        tl.broadcast_to(scale_blk[:, None], (BLOCK_KP2 // 8, 8)), (BLOCK_KP2,)
+    )
 
     # Row a: normalize + encode + pack
     ca_e = _fp4_encode(a_e / bcols)
@@ -244,10 +251,11 @@ def _mxfp4_quantize_kernel(
             OutQ + (2 * pid + 1) * stride_q_r + cols * stride_q_k, packed_b, mask=mask
         )
 
-    # Per-block scale: ue8m0, kb-major layout [K/16][R2]
+    # Per-block scale: ue8m0 (e + 127), kb-major layout [K/16][R2]
     kb = tl.arange(0, BLOCK_KP2 // 8)
     k_mask = kb < K // 16
-    tl.store(OutS + kb * R2 + pid, _ue8m0_vec(bs), mask=k_mask)
+    e_byte = tl.clamp(e_blk + 127.0, 0.0, 255.0).to(tl.uint8)
+    tl.store(OutS + kb * R2 + pid, e_byte, mask=k_mask)
 
 
 def mxfp4_block_quantize(w, mode: str = "A"):
