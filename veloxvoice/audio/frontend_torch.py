@@ -22,6 +22,7 @@ class FrontendConfig:
     preemph: float = 0.97
     cmvn_mean: "object | None" = None  # [n_mel] device array
     cmvn_istd: "object | None" = None
+    precision: str = "bf16"  # "fp32", "bf16", "mxfp4"
 
 
 class _FrameBookkeeping:
@@ -55,6 +56,31 @@ class TorchGpuFrontend:
         self._buf = torch.zeros(0, device=device)  # pre-emphasized samples
         self._tail = torch.zeros(1, device=device)
 
+        # Pre-quantize mel for mxfp4 path
+        self._mel_codes = None
+        self._mel_scales = None
+        self._F_padded = None
+        self._M_padded = None
+        if c.precision == "mxfp4" and device.startswith("cuda"):
+            from veloxvoice.kernels.ops.triton_ops import mxfp4_block_quantize
+
+            F = self.mel.shape[1]
+            M = self.mel.shape[0]
+            BK, BN = 64, 128
+            F_padded = ((F + BK - 1) // BK) * BK
+            M_padded = ((M + BN - 1) // BN) * BN
+            self._F_padded = F_padded
+            self._M_padded = M_padded
+            mel_padded = torch.zeros(
+                M_padded, F_padded, device=device, dtype=torch.float32
+            )
+            mel_padded[:M, :F] = self.mel
+            self._mel_codes, self._mel_scales = mxfp4_block_quantize(
+                mel_padded, mode="B"
+            )
+            # Free the padded mel tensor
+            del mel_padded
+
     def _preemph(self, pcm):
         """pcm: 1-D device tensor. Prepends tail sample so the filter is seamless."""
         x = self.backend.cat([self._tail, pcm])
@@ -68,11 +94,25 @@ class TorchGpuFrontend:
         win = frames * self.window
         spec = backend.fft.rfft(win, n=self.n_fft)  # [T, F] complex
         if self.device.startswith("cuda"):
-            from veloxvoice.kernels.ops import power_mel_log
+            precision = self.cfg.precision
+            if precision == "mxfp4" and self._mel_codes is not None:
+                from veloxvoice.kernels.ops import power_mel_log_mxfp4
 
-            return power_mel_log(
-                spec.contiguous(), self.mel, self.cfg.cmvn_mean, self.cfg.cmvn_istd
-            )
+                return power_mel_log_mxfp4(
+                    spec.contiguous(),
+                    self._mel_codes,
+                    self._mel_scales,
+                    self.cfg.cmvn_mean,
+                    self.cfg.cmvn_istd,
+                    self._F_padded,
+                    self._M_padded,
+                )
+            else:
+                from veloxvoice.kernels.ops import power_mel_log
+
+                return power_mel_log(
+                    spec.contiguous(), self.mel, self.cfg.cmvn_mean, self.cfg.cmvn_istd
+                )
         power = spec.real**2 + spec.imag**2
         feat = power @ self.mel.T  # [T, M]
         feat = backend.log(backend.clamp_min(feat, float(1.1920929e-7)))

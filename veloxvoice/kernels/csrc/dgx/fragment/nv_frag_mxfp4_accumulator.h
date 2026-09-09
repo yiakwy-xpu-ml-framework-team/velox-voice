@@ -112,6 +112,45 @@ struct Mxfp4Accumulator {
         mxfp4_mma(acc + (mi * TN + ni) * 4, af[mi], bf[ni]);
   }
 
+  /* Block-scaled MMA: feeds real per-block ue8m0 scales into the hardware
+   * mxf4nvf4.block_scale.scale_vec::2X instruction (sm_121a, probed).
+   *
+   * Validated instruction semantics:
+   *   - thread (g,t): scale u32 byte0 = ue8m0 for own k-slice [16t,16t+8),
+   *                   byte1 = ue8m0 for k-slice [16t+8,16t+16);
+   *   - A-side scale is SHARED across the thread's row-pair (2g,2g+1);
+   *   - B-side scale is independent per column; bytes 2-3 ignored; z u16 = 0.
+   *
+   * Quantization contract (per 16-column block, one ue8m0):
+   *   - A: rows grouped pairwise; scale grid [K/16][BM/2]
+   *   - B: per column;            scale grid [K/16][BN]
+   * Per stage (BK=64 -> 4 blocks of 16): thread t owns block #t, so its two
+   * scale slots are identical:  u32 = u8 * 0x0101.
+   *
+   * sx: [STAGES][4 * BM/2] u8 A-scale tile; sy: [STAGES][4 * BN] u8 B-scale tile.
+   */
+  __device__ inline void mma_scaled_blk(const uint32_t* shmem_X, const uint32_t* shmem_W,
+                                        const uint8_t* sx, const uint8_t* sy,
+                                        int BM2 /* = BM/2 */, int BN,
+                                        int warpM, int warpN, int KWP, int lane_id) {
+    const int g = lane_id / 4, t = lane_id % 4;
+    uint32_t af[TM][4], bf[TN][2];
+    load_af(shmem_X, warpM, KWP, lane_id, af);
+    load_bf(shmem_W, warpN, KWP, lane_id, bf);
+
+#pragma unroll
+    for (int mi = 0; mi < TM; ++mi) {
+      const int gp = warpM / 2 + mi * 8 + g;  /* row-pair local index */
+      uint32_t sa = (uint32_t)sx[t * BM2 + gp] * 0x0101u;
+#pragma unroll
+      for (int ni = 0; ni < TN; ++ni) {
+        const int c = warpN + ni * 8 + g;  /* column local index */
+        uint32_t sb = (uint32_t)sy[t * BN + c] * 0x0101u;
+        mxfp4_mma(acc + (mi * TN + ni) * 4, af[mi], bf[ni], sa, sb);
+      }
+    }
+  }
+
   template <int BM, int BN>
   __device__ inline void store(float* smem, int warpM, int warpN,
                                int lane_id, int M, int N) {
@@ -131,7 +170,26 @@ struct Mxfp4Accumulator {
     }
   }
 
-  // TODO (yiakwy) : override epilogue store without scale
+  /* mxfp4 epilogue: raw write, no scale multiply (scales were consumed in-MMA). */
+  template <int BM, int BN>
+  __device__ inline void store_raw(float* Out, int baseM, int baseN, int M, int N,
+                                   int warpM, int warpN, int lane_id) {
+    const int g = lane_id / 4, t = lane_id % 4;
+#pragma unroll
+    for (int mi = 0; mi < TM; ++mi) {
+#pragma unroll
+      for (int ni = 0; ni < TN; ++ni) {
+        const int row0 = baseM + warpM + mi * 16 + 2 * g;
+        const int col0 = baseN + warpN + ni * 8 + 2 * t;
+        const int base = (mi * TN + ni) * 4;
+        if (row0   < M && col0   < N) Out[(row0+0)*N+col0+0] = acc[base+0];
+        if (row0   < M && col0+1 < N) Out[(row0+0)*N+col0+1] = acc[base+1];
+        if (row0+1 < M && col0   < N) Out[(row0+1)*N+col0+0] = acc[base+2];
+        if (row0+1 < M && col0+1 < N) Out[(row0+1)*N+col0+1] = acc[base+3];
+      }
+    }
+  }
+
   template <int BM, int BN>
   __device__ inline void store(float* Out, const float* xs_fp32,
                                const float* ws_fp32,

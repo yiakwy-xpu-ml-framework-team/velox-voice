@@ -43,34 +43,61 @@ class DenseLinear(nn.Linear):
             if b is not None:
                 self.bias.copy_(b)
         self.precision = os.environ.get("VELOXVOICE_ASR_PRECISION", "fp32")
+        # Pre-quantize weight for mxfp4 (user mandate: weight pre-quantize)
+        self._wq = None
+        self._ws = None
+        self._w_bf16 = None
+
+    def _prequantize_weight(self, precision):
+        """Pre-quantize weight once for nvfp4/mxfp4. Call after moving to device."""
+        if (
+            precision in ("nvfp4", "mxfp4")
+            and self._wq is None
+            and self.weight.device.type == "cuda"
+        ):
+            from veloxvoice.kernels.ops.triton_ops import per_row_col_quantize
+            from veloxvoice.models.wenet.mxfp4_linear import _pad16
+
+            # Pad N (weight rows) to K_BN=128 for GEMM alignment
+            w_padded = _pad16(self.weight.detach().float(), 128)
+            self._wq, self._ws = per_row_col_quantize(w_padded)
+            self._w_bf16 = w_padded.to(torch.bfloat16)
+            self._w_N_actual = self.weight.shape[0]
 
     def forward(self, x):
-        if getattr(self, "precision", "fp32") == "nvfp4":
+        precision = getattr(self, "precision", "fp32")
+        if precision in ("nvfp4", "mxfp4"):
             orig_shape = x.shape
             if x.dim() == 3:
                 x = x.reshape(-1, orig_shape[-1])
-            from veloxvoice.kernels.ops import dgx_mxfp4_gemm
-            from veloxvoice.models.wenet.mxfp4_linear import (
-                CODE_16,
-                _encode_codes,
-                _pad16,
-                pack_codes,
-            )
 
-            absmax = self.weight.detach().abs().max().clamp(1e-6)
-            w_scale = absmax / CODE_16
-            codes_w = pack_codes(
-                _encode_codes(_pad16(self.weight.detach(), 128) / w_scale)
-            )
-            x_scale = x.detach().abs().max().clamp(1e-6) / CODE_16
-            codes_x = pack_codes(_encode_codes(_pad16(x, 128) / x_scale))
-            out = dgx_mxfp4_gemm(
-                codes_x,
-                codes_w,
-                torch.full((codes_w.shape[1],), 127, device="cuda", dtype=torch.uint8),
-                torch.full((codes_w.shape[1],), 127, device="cuda", dtype=torch.uint8),
-            )
-            out = out[: x.shape[0], : self.out_features] * x_scale * w_scale
+            # Lazy pre-quantize weight
+            if self._wq is None:
+                self._prequantize_weight(precision)
+
+            if precision == "nvfp4":
+                from veloxvoice.kernels.ops import nvfp4_linear
+
+                out = nvfp4_linear(x, self._wq, self._ws, w_bf16=self._w_bf16)
+                out = out[:, : self._w_N_actual]
+            else:  # mxfp4 — same per-matrix scalar scale path, different naming
+                from veloxvoice.kernels.ops import dgx_mxfp4_gemm
+                from veloxvoice.kernels.ops.triton_ops import triton_quantize_w
+
+                M_actual = x.shape[0]
+                K_BM = 128
+                M_padded = ((M_actual + K_BM - 1) // K_BM) * K_BM
+                if M_padded != M_actual:
+                    x_pad = torch.zeros(
+                        M_padded, x.shape[1], device=x.device, dtype=x.dtype
+                    )
+                    x_pad[:M_actual] = x
+                else:
+                    x_pad = x
+                xq, xs = triton_quantize_w(x_pad.float())
+                out = dgx_mxfp4_gemm(xq, self._wq, xs, self._ws)
+                out = out[:M_actual, : self._w_N_actual]
+
             if self.bias is not None:
                 out = out + self.bias
             if len(orig_shape) == 3:
@@ -378,8 +405,21 @@ class WenetConformerASR:
 
     def set_fp16(self, on: bool):
         """A2 ablation: autocast-cuda fp16 for the encoder (weights unchanged).
-        autocast 处理: Linear/Conv/matmul → fp16.accum; LN/softmax/LayerNorm → fp32 同路."""
+        autocast handles: Linear/Conv/matmul -> fp16 accum; LN/softmax/LayerNorm -> fp32 same path.
+        """
         self.fp16_mode = bool(on)
+
+    def set_precision(self, precision: str):
+        """Set precision for all DenseLinear layers (fp32/nvfp4/mxfp4).
+
+        mxfp4: weight pre-quantized once, activation online quantized per call.
+        nvfp4: per-matrix absolute-max quantization, smart dispatch.
+        """
+        for module in self.modules():
+            if isinstance(module, DenseLinear):
+                module.precision = precision
+                if precision in ("nvfp4", "mxfp4"):
+                    module._prequantize_weight(precision)
 
     @property
     def embeds_cmvn(self) -> bool:

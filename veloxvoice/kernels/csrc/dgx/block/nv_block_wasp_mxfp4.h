@@ -208,4 +208,131 @@ struct BlackwellPersistentMxfp4Pipeline {
   }
 };
 
+/* Block-scaled mxfp4 pipeline: per-16-column ue8m0 scales consumed INSIDE the
+ * mxf4nvf4 block_scale MMA (see mma_scaled_blk for the probed semantics).
+ *
+ * Contract:
+ *   - scale_A: ue8m0 u8, layout [K/16][M/2]  (A quantized per row-PAIR x 16 col)
+ *   - scale_B: ue8m0 u8, layout [K/16][N]    (B quantized per column   x 16 col)
+ *   - per stage (BK cols): 4 sixteen-col blocks -> 4 scale bytes per row-pair.
+ * Producers TMA both codes and scales; consumers run mma_scaled_blk + store_raw.
+ */
+template <int BM, int BN, int BK, int STAGES, int GROUP_SIZE_M, int CLUSTER_SIZE_M>
+struct BlackwellPersistentMxfp4BlkScaledPipeline {
+  static constexpr int WARP = 32;
+  static constexpr int P = NUM_PRODUCER_WARPS;
+  static constexpr int C = NUM_CONSUMER_WARPS;
+  static constexpr int TOTAL_WARPS = P + C;
+  static constexpr int TOTAL_THREADS = TOTAL_WARPS * WARP;
+
+  static constexpr int WN = 2;
+  static constexpr int WM = C / WN;
+  static constexpr int TM_ROWS = BM / WM;
+  static constexpr int TN_COLS = BN / WN;
+  static constexpr int TM = TM_ROWS / 16;
+  static constexpr int TN = TN_COLS / 8;
+  static constexpr int KWP = BK / 8;
+
+  static constexpr int KBLK = 16;            /* ue8m0 block width (cols) */
+  static constexpr int KBPS = BK / KBLK;     /* blocks per stage = 4     */
+
+  static_assert(BM % 2 == 0, "BM must be even (row-pair A quantization)");
+  static_assert(BK % KBLK == 0);
+  static_assert(C % WN == 0 && TM_ROWS % 16 == 0 && TN_COLS % 8 == 0);
+
+  struct SmemLayout {
+    uint32_t shmem_X[STAGES][BM * KWP];
+    uint32_t shmem_W[STAGES][BN * KWP];
+    uint64_t full[STAGES];
+    uint64_t empty[STAGES];
+    alignas(128) uint8_t sx[STAGES][KBPS * (BM / 2)];
+    alignas(128) uint8_t sy[STAGES][KBPS * BN];
+  };
+
+  static __device__ inline void run_persistent(
+      const CUtensorMap* tma_desc_A, const CUtensorMap* tma_desc_B,
+      const CUtensorMap* tma_desc_sA, const CUtensorMap* tma_desc_sB,
+      float* Out, int M, int N, int K,
+      int num_blocks_m, int num_blocks_n, uint8_t* smem_buffer) {
+    SmemLayout* smem = reinterpret_cast<SmemLayout*>(smem_buffer);
+    const int tid = threadIdx.x;
+    const int warp_id = tid / WARP;
+    const int lane_id = tid % WARP;
+
+    const bool is_producer = (warp_id < P);
+
+    if (tid < STAGES) {
+      nvgpu::arch::mbar_init(&smem->full[tid], 1);
+      nvgpu::arch::mbar_init(&smem->empty[tid], C);
+    }
+    nvgpu::arch::warpgroup_sync<TOTAL_THREADS>();
+
+    const int total_tiles = num_blocks_m * num_blocks_n;
+    for (int tile = (int)blockIdx.x; tile < total_tiles; tile += (int)gridDim.x) {
+      int bm, bn;
+      swizzle2d<GROUP_SIZE_M>(tile, num_blocks_m, num_blocks_n, bm, bn);
+
+      const int baseM = bm * BM, baseN = bn * BN;
+      const int ns = K / BK;
+
+      if (is_producer) {
+        const int producer_id = warp_id;
+        if (lane_id == 0) {
+          for (int s = producer_id; s < ns; s += P) {
+            const int buf = s % STAGES;
+
+            if (s >= STAGES) {
+              nvgpu::arch::mbar_wait(&smem->empty[buf], ((s / STAGES) & 1) ^ 1);
+            }
+
+            nvgpu::arch::mbar_expect_tx(&smem->full[buf],
+                BM * KWP * 4 + BN * KWP * 4 + KBPS * (BM / 2) + KBPS * BN);
+            nvgpu::arch::tma_load_2d_bytes(tma_desc_A, smem->shmem_X[buf],
+                                           s * (BK / 2), baseM,
+                                           &smem->full[buf]);
+            nvgpu::arch::tma_load_2d_bytes(tma_desc_B, smem->shmem_W[buf],
+                                           s * (BK / 2), baseN,
+                                           &smem->full[buf]);
+            /* scale tiles: [K/16][R] -> box {R, KBPS} at (row_off, s*KBPS) */
+            nvgpu::arch::tma_load_2d_bytes(tma_desc_sA, smem->sx[buf],
+                                           baseM / 2, s * KBPS,
+                                           &smem->full[buf]);
+            nvgpu::arch::tma_load_2d_bytes(tma_desc_sB, smem->sy[buf],
+                                           baseN, s * KBPS,
+                                           &smem->full[buf]);
+          }
+        }
+      }
+
+      if (!is_producer) {
+        const int cw = warp_id - P;
+        const int cm = cw / WN;
+        const int cn = cw % WN;
+        const int warpM = cm * TM_ROWS;
+        const int warpN = cn * TN_COLS;
+
+        Mxfp4Accumulator<TM, TN> accum;
+        accum.clear();
+
+        for (int s = 0; s < ns; ++s) {
+          const int buf = s % STAGES;
+          nvgpu::arch::mbar_wait(&smem->full[buf], (s / STAGES) & 1);
+
+          accum.mma_scaled_blk(smem->shmem_X[buf], smem->shmem_W[buf],
+                               smem->sx[buf], smem->sy[buf],
+                               BM / 2, BN, warpM, warpN, KWP, lane_id);
+
+          if (lane_id == 0) {
+            nvgpu::arch::mbar_arrive(&smem->empty[buf]);
+          }
+        }
+
+        accum.store_raw<BM, BN>(Out, baseM, baseN, M, N, warpM, warpN, lane_id);
+      }
+
+      nvgpu::arch::warpgroup_sync<TOTAL_THREADS>();
+    }
+  }
+};
+
 }  // namespace xpu

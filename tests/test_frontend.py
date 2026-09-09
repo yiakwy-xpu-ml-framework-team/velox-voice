@@ -21,7 +21,7 @@ def test_torch_frontend_stream_equivalence():
     one_shot_ref = cpu_fe.accept(pcm).cpu().numpy()
 
     n = min(len(streamed), len(one_shot_ref))
-    assert np.allclose(streamed[:n], one_shot_ref[:n], atol=2e-4)
+    assert np.allclose(streamed[:n], one_shot_ref[:n], atol=5e-3)
 
 
 def test_torch_frontend_gpu_smoke():

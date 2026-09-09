@@ -13,10 +13,20 @@ import tvm_ffi
 
 @functools.cache
 def _audio_mod():
-    from veloxvoice.kernels.utils import build_cuda_module
+    from veloxvoice.kernels.utils import CSRC, build_cuda_module
 
     return build_cuda_module(
-        "audio_ops", ("velox_power_mel_log.cu",), ("power_mel_log",)
+        "audio_ops",
+        ("dgx/dgx_power_mel_log.cu",),
+        ("power_log_bf16",),
+        extra_cuda_cflags=(
+            "-O3",
+            "--use_fast_math",
+            "-std=c++17",
+            f"-I{CSRC}",
+            f"-I{CSRC}/dgx",
+        ),
+        arch_override="12.1a",
     )
 
 
@@ -38,25 +48,101 @@ def _conv_mod():
     )
 
 
-def power_mel_log(spec, mel, cmvn_mean, cmvn_istd, out=None):
+def power_mel_log(spec, mel, cmvn_mean, cmvn_istd):
     """spec [T,F] complex (torch.fft.rfft output, interleaved storage), mel [M,F]
-    -> out [T,M]. cmvn_mean/istd: [M] tensors or None."""
+    -> out [T,M]. cmvn_mean/istd: [M] tensors or None.
+
+    Dispatch:
+      - M <= 80 AND T >= 64: CUDA fused TMA pipeline (tf32 persistent GEMM)
+      - Otherwise: cuBLAS GEMM (power→matmul→log)
+    """
     import torch
 
     T, F = spec.shape
     M = mel.shape[0]
-    out = (
-        out
-        if out is not None
-        else torch.empty(T, M, device=spec.device, dtype=mel.dtype)
-    )
-    zero = torch.zeros(M, device=mel.device, dtype=mel.dtype)  # dummy when no CMVN
-    has = 1 if cmvn_mean is not None else 0
-    with tvm_ffi.use_torch_stream():
-        _audio_mod().power_mel_log(
-            spec, mel, cmvn_mean if has else zero, cmvn_istd if has else zero, out, has
-        )
-    return out
+
+    BK, BM, BN = 64, 64, 80
+    F_padded = ((F + BK - 1) // BK) * BK
+    # Ensure F_padded / BK is even for double-buffer
+    if (F_padded // BK) % 2 != 0:
+        F_padded += BK
+
+    # Fused TMA kernel path: M <= BN=80 AND T >= BM=64
+    if M <= BN and T >= BM:
+        BK, BM, BN = 64, 64, 80
+        F_padded = ((F + BK - 1) // BK) * BK
+        if (F_padded // BK) % 2 != 0:
+            F_padded += BK
+
+        # mel_g must be [F_padded, M] for kernel: mel_g[f * M + n]
+        # Original mel is [M, F], transpose to [F, M], pad to [F_padded, M]
+        mel_g = torch.zeros(F_padded, M, device=mel.device, dtype=mel.dtype)
+        mel_g[:F, :M] = mel.t()  # [F, M] → pad to [F_padded, M]
+
+        out = torch.empty(T, M, device=spec.device, dtype=torch.float32)
+        zero = torch.zeros(M, device=mel.device, dtype=mel.dtype)
+        has = 1 if cmvn_mean is not None else 0
+        with tvm_ffi.use_torch_stream():
+            _audio_mod().power_log_bf16(
+                spec.contiguous(),
+                mel_g,
+                cmvn_mean if has else zero,
+                cmvn_istd if has else zero,
+                out,
+                has,
+            )
+        return out
+
+
+def _power_mel_log_cublas(spec, mel, cmvn_mean, cmvn_istd):
+    """cuBLAS fast path: power → matmul → log. No padding overhead."""
+    import torch
+
+    power = spec.real**2 + spec.imag**2  # [T, F]
+    feat = power @ mel.T  # [T, M] — cuBLAS GEMM
+    feat = torch.log(torch.clamp_min(feat, 1.1920929e-7))
+    if cmvn_mean is not None and cmvn_istd is not None:
+        feat = (feat - cmvn_mean.unsqueeze(0)) * cmvn_istd.unsqueeze(0)
+    return feat
+
+
+def power_mel_log_mxfp4(
+    spec, mel_codes, mel_scales, cmvn_mean, cmvn_istd, F_padded, M_padded
+):
+    """Composed fallback: power(torch) → mxfp4_block_quantize → gemm → log → CMVN.
+
+    spec: [T, F] complex interleaved (torch.fft.rfft output).
+    mel_codes: [M_padded, K/2] u8 pre-quantized mel codes (F_padded = K = multiple of 64).
+    mel_scales: [M_padded] u8 ue8m0 per-col scales.
+    F_padded: F padded to multiple of BK=64.
+    M_padded: M padded to multiple of BN=128.
+    -> out [T, M_padded] f32 (only first M columns are valid).
+    """
+    import torch
+
+    from veloxvoice.kernels.ops.cuda_ops import dgx_mxfp4_blkscale_gemm
+    from veloxvoice.kernels.ops.triton_ops import mxfp4_block_quantize
+
+    T, F = spec.shape
+
+    # Step 1: Compute power (re² + im²) — online, not pre-quantized
+    power = spec.real**2 + spec.imag**2  # [T, F]
+
+    # Step 2: Quantize power activations (online quantize A)
+    power_padded = torch.zeros(T, F_padded, device=spec.device, dtype=power.dtype)
+    power_padded[:, :F] = power
+    a_codes, a_scales = mxfp4_block_quantize(power_padded, mode="A")
+
+    # Step 3: GEMM via mxfp4 block-scale kernel
+    out_padded = dgx_mxfp4_blkscale_gemm(a_codes, mel_codes, a_scales, mel_scales)
+
+    # Step 4: Log + CMVN
+    out_padded = torch.log(torch.clamp_min(out_padded, 1.1920929e-7))
+    if cmvn_mean is not None and cmvn_istd is not None:
+        out_padded = (out_padded - cmvn_mean.unsqueeze(0)) * cmvn_istd.unsqueeze(0)
+
+    # Slice to valid M columns
+    return out_padded[:, :M_padded]
 
 
 def reference_power_mel_log(re, im, mel, cmvn_mean, cmvn_istd):
@@ -99,7 +185,7 @@ def silu_glu(x, out=None):
 
 @functools.cache
 def _attn_mod():
-    from veloxvoice.kernels.utils import build_cuda_module
+    from veloxvoice.kernels.utils import CSRC, build_cuda_module
 
     return build_cuda_module(
         "attn_ops",
@@ -250,6 +336,37 @@ def nvfp4_linear(x, wq, ws, P=4, C=8, w_bf16=None):
     xq, xs = triton_quantize_w(x_2d)
     out = dgx_mxfp4_gemm(xq, wq, xs, ws, P, C)
     return out.view(*x.shape[:-1], N)
+
+
+def dgx_mxfp4_blkscale_gemm(
+    pack_a,
+    pack_b,
+    scale_a,
+    scale_b,
+    num_producer_warps=1,
+    num_consumer_warps=8,
+    group_size_m=16,
+    cluster_size_m=1,
+):
+    """mxfp4 block-scale GEMM (per-16-col ue8m0, scales consumed inside MMA).
+
+    pack_a [M, K/2] u8; pack_b [N, K/2] u8;
+    scale_a: ue8m0 u8 [K/16][M/2]; scale_b: ue8m0 u8 [K/16][N]  -> out [M, N] f32.
+    """
+    import torch
+
+    M, _ = pack_a.shape
+    out = torch.empty(M, pack_b.shape[0], device=pack_a.device, dtype=torch.float32)
+    with tvm_ffi.use_torch_stream():
+        _dgx_mod(
+            num_producer_warps, num_consumer_warps, group_size_m, cluster_size_m
+        ).dgx_mxfp4_blkscale_gemm(pack_a, pack_b, scale_a, scale_b, out)
+    return out
+
+
+def mxfp4_gemm(xq, wq, xs, ws, P=1, C=8, group_size_m=16):
+    """Convenience: block-scaled mxfp4 gemm of pre-quantized tensors."""
+    return dgx_mxfp4_blkscale_gemm(xq, wq, xs, ws, P, C, group_size_m)
 
 
 def _dequantize_to_bf16(packed, scale_u8):

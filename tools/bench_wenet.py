@@ -158,18 +158,28 @@ def main():
         default=False,
         help="velox JIT kernel",
     )
+    ap.add_argument(
+        "--precision",
+        choices=["fp32", "bf16", "mxfp4"],
+        default="bf16",
+        help="frontend precision mode (default: bf16)",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.model_dir)
     text_tok = TextTokenizer(os.path.join(args.model_dir, "units.txt"))
     fe = TorchGpuFrontend(
-        FrontendConfig(sample_rate=16000, num_mel_bins=cfg.input_dim), args.device
+        FrontendConfig(
+            sample_rate=16000, num_mel_bins=cfg.input_dim, precision=args.precision
+        ),
+        args.device,
     )
 
     verify_correctness(fe, args)
 
     m = WenetConformerASR(args.model_dir, device=args.device)
     m.set_jit(args.use_jit)
+    m.set_precision(args.precision)
 
     # NOTE (yiakwy) : prepare audio and transcripts
     jobs = []
@@ -189,7 +199,9 @@ def main():
                 base = os.path.splitext(f)[0]
                 jobs.append((base, os.path.join(args.audio_dir, f), refs.get(base)))
 
-    print(f"benchmark [jit={'ON' if args.use_jit else 'OFF'}] iters={args.iters}...")
+    print(
+        f"benchmark [jit={'ON' if args.use_jit else 'OFF'}] precision={args.precision} iters={args.iters}..."
+    )
     tot_e = tot_w = 0.0
     elapse_enc_list, enc_rtf_list, tot_wall = [], [], 0.0
     for name, path, ref in jobs:

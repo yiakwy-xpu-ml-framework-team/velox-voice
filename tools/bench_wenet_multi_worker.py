@@ -436,7 +436,8 @@ def main():
     ap.add_argument("--iters", type=int, default=1)
     ap.add_argument("--use-jit", action=argparse.BooleanOptionalAction, default=False)
 
-    # TODO (yiakwy) : add mxfp8, nvfp4
+    # NOTE: fp8/mxfp8 paths removed (never validated); nvfp4/mxfp4 live in
+    # `precision=` branch of DenseLinear (veloxvoice/models/wenet/torch_conformer.py).
     ap.add_argument("--fp16", action="store_true", help="use fp16 to encode audio")
 
     # NOTE (yiakwy) : used by transcribe functions, do not call it manually
