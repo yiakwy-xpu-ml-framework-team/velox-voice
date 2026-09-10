@@ -25,14 +25,7 @@ pip install -e .
 ## 2. Sanity checks (test suites)
 
 ```bash
-python -m compileall veloxvoice
-pytest -q                               # expect: 13 passed, 1 skipped
-python tools/kernel_harness.py verify silu_glu
-python tools/kernel_harness.py verify dw_causal_conv1d
-python tools/kernel_harness.py verify layernorm
-python tools/kernel_harness.py verify power_mel_log
-python tools/kernel_harness.py verify chunk_rel_pos_attn
-python tools/kernel_harness.py verify dgx_mxfp4_gemm --shape 2048,2048,2048
+pytest tests/kernels/test_cuda_ops.py
 ```
 
 ## 3. Reproduce the 6-minute RTF result (streaming lane)

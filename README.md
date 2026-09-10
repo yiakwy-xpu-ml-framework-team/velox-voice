@@ -36,13 +36,12 @@ In DGX Spark, our latest results shows that we can achive RTF **0.0015** for 1 h
 This restul fundamental changed streaming logics of previous audio task, where **velox voice** is good for.
 
 
-| workload                        | wall    | RTF     |
-|---------------------------------|---------|---------|
-| API baseline (torchscript lane) | 3.52 s  | 0.0353  |
-| API optimized, 99.6 s audio     | **99 ms** | **0.0010** |
-| API optimized, 1 h audio        | 5.3 s   | **0.0015** |
-|
-
+| workload                    | GPU              | wall       | RTF        |
+|-----------------------------|------------------|------------|------------|
+| baseline (torchscript lane) | dgx spark (GB10) |   3.52 s   | 0.0353     |
+| 99.6 s audio                | dgx spark (GB10) | **99 ms**  | **0.0010** |
+| multi worker, 1 h audio     | dgx spark (GB10) |   5.3  s   | **0.0015** |
+| multi worker, 1 h audio     | Hopper superPod  | **997 ms** | **0.0003** |
 
 
 ## Overview
