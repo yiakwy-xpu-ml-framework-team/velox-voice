@@ -1,4 +1,4 @@
-"""Single Model Test: wenet torch module transcribing test (bypass veloxvoice.api).
+"""Single Model Test : wenet torch module transcribing test (bypass veloxvoice.api).
 Enable velox JIT kernel (fused_layernorm + silu_glu) with --use-jit / --no-jit.
 
 Usage:

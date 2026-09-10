@@ -1,4 +1,4 @@
-"""Single MOdel Test : wenet torch module (WenetConformerASR) transcribing test (bypass veloxvoice.api).
+"""Single Model Test : wenet torch module transcribing test (bypass veloxvoice.api).
 Enable velox JIT kernel (pwlin + fused_layernorm + silu_glu) with --use-jit / --no-jit.
 Enable multi-process audio encoding under different GPU streams
 
@@ -138,9 +138,19 @@ def transcribe(
     device,
     max_mel_arg: int | None = None,
     fp16_on: bool = False,
-    max_calls: int = max(int(os.environ.get("WENET_INPROC_MAX_CALLS", "9999")), 3),
+    max_calls: int | None = None,
 ):
     t0 = time.perf_counter()
+
+    # NOTE (yiakwy) : one wave per GPU
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    if max_calls is None:
+        env_calls = os.environ.get("WENET_INPROC_MAX_CALLS")
+        max_calls = (
+            max(int(env_calls), 3)
+            if env_calls is not None
+            else (9999 if n_gpus <= 1 else 3)
+        )
 
     fe = TorchGpuFrontend(
         FrontendConfig(sample_rate=16000, num_mel_bins=cfg.input_dim), device
@@ -237,7 +247,14 @@ def transcribe(
             pcm_path = os.path.join(tmpdir, "pcm.npy")
             np.save(pcm_path, pcm_np)
 
-            PAR_ENV = os.environ.get("WENET_PAR_WORKERS", "serial")
+            # default parallelism = number of GPUs (one worker per device)
+            PAR_ENV = os.environ.get("WENET_PAR_WORKERS")
+            if PAR_ENV is None:
+                PAR_ENV = str(n_gpus) if n_gpus > 1 else "serial"
+            print(
+                f"  [multi worker transcribe] dispatch: gpus={n_gpus} "
+                f"spans={len(spans)} max_calls={max_calls} PAR={PAR_ENV}"
+            )
 
             groups = (
                 [spans]
@@ -276,8 +293,12 @@ def transcribe(
                         json.dump(job, f)
 
                     print(
-                        f"  [multi worker transcribe] [spawn@{time.time():.3f}] gm={gi} em-span={len(grp)}"
+                        f"  [multi worker transcribe] [spawn@{time.time():.3f}] gm={gi} em-span={len(grp)} gpu={gi % max(n_gpus, 1)}"
                     )
+                    wenv = dict(os.environ)
+                    if n_gpus > 1:
+                        # pin each worker to its own GPU (worker sees it as cuda:0)
+                        wenv["CUDA_VISIBLE_DEVICES"] = str(gi % n_gpus)
                     p = subprocess.Popen(
                         [
                             sys.executable,
@@ -292,6 +313,7 @@ def transcribe(
                             "--job-id",
                             f"wave#{wgi}:seq#{i}",
                         ],
+                        env=wenv,
                         stdout=(
                             None
                             if os.environ.get("WENET_STREAM_WORKER", "0") == "1"
