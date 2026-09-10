@@ -100,6 +100,46 @@ def wer(ref, hyp):
     return d[n][len(h)], n
 
 
+def _max_mel_frames(model, cfg):
+    """Long-audio cap, see veloxvoice/api.py"""
+    max_len = max(getattr(model, "pos_max_len", 5000), 1000)
+    return min(15000, (max_len - 200) * cfg.subsampling)
+
+
+def _spans_for(feats, max_mel, pcm):
+    """[(a, b)] slices of feats; long audio split at low-energy points (VAD)."""
+    n = feats.shape[0]
+    if n <= max_mel:
+        return [(0, n)]
+
+    # from veloxvoice.api import _low_energy_spans
+    def _low_energy_spans(n_frames: int, max_frames: int, db) -> list[tuple[int, int]]:
+        """Split [0, n_frames) into spans of <= max_frames, cutting each span at the
+        lowest-energy point found in a backward search window (<= 30 s) from the
+        nominal cut, so segment edges fall inside pauses rather than mid-word."""
+        import numpy as np
+
+        spans = []
+        a = 0
+        while n_frames - a > max_frames:
+            nominal = a + max_frames
+            lo = max(a + max_frames // 4, nominal - 3000)  # search back <= 30 s
+            hi = min(nominal, len(db) - 1)
+            cut = lo + int(np.argmin(db[lo:hi])) if hi > lo else nominal
+            cut = max(cut, a + 1)
+            spans.append((a, cut))
+            a = cut
+        spans.append((a, n_frames))
+        return spans
+
+    from veloxvoice.audio.vad_energy import frame_energy_db
+
+    db = frame_energy_db(
+        torch.as_tensor(pcm, dtype=torch.float32).reshape(-1).cpu()
+    ).numpy()
+    return _low_energy_spans(n, max_mel, db)
+
+
 def verify_correctness(fe, args, suffix=".wav"):
     wav0 = args.audio or (
         os.path.join(args.audio_dir, sorted(read_trans(args.audio_dir))[0] + suffix)
@@ -118,6 +158,16 @@ def verify_correctness(fe, args, suffix=".wav"):
         # NOTE (yiakwy) w/ JIT kernel
         m_on = WenetConformerASR(args.model_dir, device=args.device)
         m_on.set_jit(True)
+
+        # NOTE (yiakwy) : full-context encode
+        max_mel = _max_mel_frames(m_on, load_config(args.model_dir))
+        if feats0.shape[0] > max_mel:
+            print(
+                f"[verify_correctness] feats {feats0.shape[0]} -> {max_mel} "
+                f"(positional window; full audio is segmented in the benchmark)"
+            )
+            feats0 = feats0[:max_mel]
+
         d_on = CtcGreedyDecoder()
         d_on.push_logp(m_on.ctc_logp(m_on.encode_utterance(feats0[None]))[0])
 
@@ -216,9 +266,14 @@ def main():
         # extract features
         feats = torch.cat([fe.accept(pcm), fe.flush()], dim=0)
 
+        # long audio: segment at low-energy points (pos_pe caps at pos_max_len)
+        max_mel = _max_mel_frames(m, cfg)
+        spans = _spans_for(feats, max_mel, pcm)
+
         start_enc = time.perf_counter()
 
-        enc = m.encode_utterance(feats[None])
+        # enc = m.encode_utterance(feats[None])
+        enc = torch.cat([m.encode_utterance(feats[a:b][None]) for a, b in spans], dim=1)
 
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -231,10 +286,8 @@ def main():
 
         dec = CtcGreedyDecoder()
         dec.push_logp(logp)
-        elapsed_dec_ctc = time.perf_counter() - start_dec
-
         txt = text_tok.ids_to_text(dec.tokens).strip().lower()
-        elapsed_dec_tokens = time.perf_counter() - start_dec
+        elapsed_dec_ctc = time.perf_counter() - start_dec
 
         late_wall = time.perf_counter() - start
 
@@ -253,9 +306,10 @@ def main():
 
         tot_wall += late_wall
 
+        seg_txt = f" segs={len(spans)}" if len(spans) > 1 else ""
         print(
-            f"[{name}] {audio_dur:6.2f}s enc={enc_elapsed *1e3:8.2f}ms, late_wall={late_wall *1e3:8.2f} "
-            f"total rtf={total_rtf:.4f}, encoder rtf={enc_rtf:.4f} (+ctc={(elapsed_dec_ctc + elapsed_dec_tokens)*1e3:4.1f}ms){wer_txt}"
+            f"[{name}] {audio_dur:6.2f}s{seg_txt} enc={enc_elapsed *1e3:8.2f}ms, late_wall={late_wall *1e3:8.2f} "
+            f"total rtf={total_rtf:.4f}, encoder rtf={enc_rtf:.4f} (+ctc={elapsed_dec_ctc *1e3:4.1f}ms){wer_txt}"
         )
         print("  hyp:", txt)
         if ref:

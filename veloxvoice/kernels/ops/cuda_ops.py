@@ -13,6 +13,7 @@ import tvm_ffi
 
 @functools.cache
 def _audio_mod():
+    from veloxvoice.kernels.helper_cuda import velox_arch_str
     from veloxvoice.kernels.utils import CSRC, build_cuda_module
 
     return build_cuda_module(
@@ -26,7 +27,9 @@ def _audio_mod():
             f"-I{CSRC}",
             f"-I{CSRC}/dgx",
         ),
-        arch_override="12.1a",
+        # '12.1a' on DGX Spark, native arch (e.g. '9.0' on Hopper) elsewhere;
+        # the tf32 mma + smem pipeline only needs base-arch features.
+        arch_override=velox_arch_str(),
     )
 
 
@@ -295,8 +298,16 @@ def _build_dgx_mod(
     num_producer_warps=1, num_consumer_warps=8, group_size_m=16, cluster_size_m=1
 ):
     """Build dgx_mxfp4_gemm with P producer warps and C consumer warps."""
+    from veloxvoice.kernels.helper_cuda import velox_arch_str
     from veloxvoice.kernels.utils import CSRC, build_cuda_module
 
+    arch = velox_arch_str()
+    if arch != "12.1a":
+        raise RuntimeError(
+            "dgx mxfp4 kernels rely on mma.sync kind::mxf4nvf4.block_scale "
+            f"(sm_121a only); unsupported on this GPU (arch {arch}). "
+            "Use precision='bf16' instead."
+        )
     return build_cuda_module(
         f"dgx_ops_p{num_producer_warps}_c{num_consumer_warps}_g{group_size_m}_cl{cluster_size_m}",
         ("dgx/dgx_mxfp4_gemm.cu",),
@@ -312,7 +323,7 @@ def _build_dgx_mod(
             f"-DK_GROUP_SIZE_M={group_size_m}",
             f"-DK_CLUSTER_SIZE_M={cluster_size_m}",
         ),
-        arch_override="12.1a",
+        arch_override=arch,
     )
 
 

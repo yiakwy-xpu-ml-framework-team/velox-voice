@@ -88,7 +88,7 @@ print(session.text())                          # real lyrics (LLM text matched b
 **Using ASR Model for short audio**
 
 ```bash
-ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd  )"
+ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/" && pwd  )"
 
 audio=$ROOT/speaker_test/meeting-test.wav
 model=$ROOT/data/models/asr_model
@@ -101,7 +101,7 @@ python $ROOT/tools/bench_wenet.py \
 
 ```bash
 
-ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd  )"
+ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/" && pwd  )"
 
 # WENET_INPROC_MAX_CALLS:
 #   9999/unset : encode per-spans in-process (multi-threaded CUDA-stream
