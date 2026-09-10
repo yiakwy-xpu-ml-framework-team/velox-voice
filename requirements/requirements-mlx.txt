@@ -1,0 +1,4 @@
+# Apple Silicon (M3/M4) — MLX lane.
+
+-r requirements.txt
+mlx

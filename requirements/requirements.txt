@@ -1,0 +1,7 @@
+# Device-agnostic install. The accelerated backend (torch + CUDA wheels, or
+# mlx) is platform-specific — see requirements-<device>.txt, e.g.:
+#   DGX Spark / H800:  pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+#   Apple Silicon:     pip install "mlx[cuda]"   (or stock mlx on macOS)
+# This file pulls in everything that does not depend on the device.
+
+-r common.txt

@@ -1,0 +1,20 @@
+# Device-agnostic dependencies (referenced by requirements*.txt via `-r`).
+# The accelerator stack itself (torch/torchaudio wheel index, mlx) is
+# platform-specific — see requirements-<device>.txt.
+
+numpy
+scipy
+pyyaml
+apache-tvm-ffi
+ninja
+triton>=3.6
+pytest
+soundfile
+huggingface_hub
+datasets
+jiwer
+matplotlib
+
+# --- optional benchmark extras ---
+# torchaudio            # mel filterbank reference in tests/benchmarks
+# librosa               # resampling reference

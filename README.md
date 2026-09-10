@@ -1,117 +1,159 @@
-# VeloxVoice
+<div align="center">
+  <p align="center">
 
-GPU-first **streaming speech** stack. v0 task: **streaming ASR with WeNet** (Conformer
-encoder + CTC). One python frontend, two module backends (PyTorch torch modules on
-NVIDIA GB10/H800, MLX modules on Apple M3), one idea: every stage of the streaming
-chunk loop stays on the accelerator and is driven by custom JIT kernels.
+  <picture>
+    <img alt="Velox Voice" src="assets/veloxvoice.svg" width="50%">
+  </p>
 
-| Platform                    | Python frontend | Kernel path                                     | Chunk execution                        |
-|----------------------------|-----------------|-------------------------------------------------|----------------------------------------|
-| H800 (Hopper, sm_90)       | torch modules   | CUDA `.cu` (TVM-FFI, disk-cached)               | eager / piecewise / fused CUDA graphs  |
-| DGX-Spark (GB10, sm_121a)  | torch modules   | same CUDA path + `csrc/dgx/` NVFP4 WASP GEMM    | same                                   |
-| Mac Studio (M3 Ultra/Mini) | mlx modules     | Metal (`mx.fast.metal_kernel`)                  | mx.compile segments + `async_eval`     |
+  <h3>🎙️ Velox Voice :  Frontier Voice Cross Platforms (Hopper / DGX Spark / MacStudio) Inference Engine with JIT Kernels</h3>
+  <a href="#cite-us">📝 Papers</a> | <a href="#QuickStart">🚀 Quick Start</a> | <a href="#support-dits">🎯 Supported Velox Voice JIT Kernels</a> | <a href="#dev-guide">📚 Dev Guide </a> | <a href="https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/discussions">📈  Discussion </a> | <a href="#Highlight">📝 Highlight </a></strong>
+  <p></p>
 
-## How we design it
+</div>
 
-```
-pcm chunk ─► GPU fbank (fused power_mel_log, CMVN on device, pinned staging)
-         ─► VoiceTokenizer (VoiceTokens: continuous fbank + discrete FSQ codes)
-         ─► WeNet Conformer (native nn.Module, custom JIT kernels, bounded caches)
-         ─► CTC greedy decode (streaming, dedupe across chunk boundaries)
-```
+This repository is porting our "Flash Float JIT Kernels" into audio task. Besides practical conformer (see below) with JIT kerenls, we are also supporting frontier audio tasks with AR models with JIT kernels from frontier audio lab.
 
-Design contracts:
+<h2 id="highlight"> Highlight </h2>
 
-1. **Unified python frontends**: the only platform difference is the module array
-   library (`torch` vs `mlx`) and the kernel/graph backend; public API
-   (`veloxvoice.Velox.load(...)`) is identical.
-2. **GPU-only preprocessing**: framing+STFT+mel+CMVN on device; PCM ingest is the
-   only host→device transfer (pinned staging on Grace-Blackwell coherent memory;
-   mmap wrapping on Apple unified memory).
-3. **Voice-token interface (WS of the TTS/AR extension)**: each chunk becomes a
-   token block — continuous fbank (what WeNet eats) and discrete FSQ codes (the
-   wire format for a future AR model). Same shapes, no re-encoding downstream.
-4. **Custom JIT kernels everywhere a shape is hot**: TVM-FFI on CUDA side
-   (`TVM_FFI_DLL_EXPORT_TYPED_FUNC` + `tvm_ffi.cpp.load_inline`, stream strictly
-   via `TVMFFIEnvGetStream`; never torch-extensions). `mx.fast.metal_kernel` on
-   Metal. gluon (triton>=3.6) references as first-pass verification.
-5. **Breakable piecewise graphs** (sglang's idea): attention over the rolling
-   cache runs as an eager split op, every graph-safe segment between two
-   attentions is captured into a CUDA graph with per-segment refresh+replay;
-   static-shape chunks come from bounded caches. Metal: `mx.compile` compiled
-   segment + `mx.async_eval`, the CPU only submits — our verified substitute of
-   CUDA graphs on MLX (`graphs/metal_runner.py`). MLX-CUDA backend does also
-   provide native CUDA graphs via `MLX_USE_CUDA_GRAPHS`.
+- Sep 10 2026, [🔥 Transcribing 1 hour candonese audio within few seconds on DGX Spark , RTF 0.001 (x1000 acceleration) 🚀 with almost good Condonese Recoginition 🎯!](#Transcribing-1-hrs-audio-in-seconds-on-dgx-spark)
 
-   Fixed-shape stream = chunk-local states (`sub`, per-layer `(k, v)`, `conv`,
-   `off` as device int32 tensor) → a whole chunk can become **one fused CUDA
-   graph** (`"cuda-graph-fused"`), removing launch fan-out entirely.
+<h2 id="Transcribing-1-hrs-audio-in-seconds-on-dgx-spark">🔥 Transcribing 1 hour audio in seconds on DGX Spark</h2>
 
-6. **Checkpoint transparency**: weights load from the upstream WeNet torchscript
-   bundle (`final.zip`) through converters that only rename/reshape/fold — our
-   native modules mirror upstream module/parameter names.
-   `use_torchscript=True` = fallback backend.
+**Transcribing 1 hour audio into few seconds**
 
-## Feature set (current)
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/fd26e9dc-9830-4d6a-a243-0d17ae425254" width="60%"> </video>
+</div>
 
-**Kernels** (`veloxvoice/kernels/`):
+Priro VeloxVoice, long audio transcribing with wenet alike model (Conformerencoder + CTC) suffers from extremely computation imbalance.
 
-- csrc/: `velox_power_mel_log` (fused fbank tail: complex rFFT power→mel→log→CMVN),
-  `velox_layernorm`, `velox_silu_glu`, `velox_depthwise_causal_conv1d` (rolling
-  left-cache roll in one launch), `velox_chunk_rel_pos_attn` (bounded-cache
-  rel-pos multi-head attention, masked), `velox_fused_qkv` (small-M GEMV
-  fused proj for chunk streams).
-- csrc/dgx/ (DGX-Spark sm_121a): **WASP 1p2c packed nvfp4/mxfp4 GEMM**
-  (TMA + `__grid_constant__` tensor maps, mbarrier stage ring, cluster(2) sync,
-  warp m16n8k64 `mma.sync.aligned.kind::mxf4nvf4.block_scale`, e8m0 scales).
-- triton3_7/: gluon references for the same ops (first-pass verification frontier).
-- csrc/mlx/: Metal urban suite: depthwise-causal-conv1d, silu_glu, power_mel_log,
-  layernorm, chunk_rel_pos_attn, **sub-1bit streamk GEMM** (streamk, splitk
-  `atomic_fetch_add`, XOR-sign unpack, 64-bit loads, double-buffer smem stripes,
-  autotuner with persistent cache), experimental simdgroup 8×8 MMA variant.
+Take the [power mel log](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33) for example usually has matrix shape of **[T, M]**, where **M** is **80** dependent on the audio sampling rate and **T** is framees depending on the duration of the audio. As a result for a long audio, traditional torch gemm does not handle this computation characteristics efficiently.
 
-**Graphs**: eager / piecewise CUDA graph / fused chunk graph / MLX metal-graph /
-MlxCompiledChunkRunner — `Velox.load(..., use_graphs="eager" | "cuda-graph" |
-"cuda-graph-fused" | "metal-graph")` or `VELOXVOICE_USE_GRAPHS`.
+We identified the issue and propose solutions with fuse JIT kernel operations tackle that bottlenect.
 
-**Tokenizer**: TextTokenizer (units.txt mapping for CTC), VoiceTokenizer
-(continuous + FSQ-discrete per chunk).
+In DGX Spark, our latest results shows that we can achive RTF **0.0015** for 1 hour audio, while on Hopper platform, RTF **0.0003** is achieved.
 
-## Transcribe (default = streaming output)
+This restul fundamental changed streaming logics of previous audio task, where **velox voice** is good for.
 
-```bash
-python examples/transcribe_mp3.py --audio /tmp/librivox.mp3 \
-    --model-dir <model_dir> --seconds 360
-```
 
-Defaults stream partials onto the screen via an async writer thread (event-only
-text building, so logging is cost-free inside the loop). Final line prints RTF
-and PASS/FAIL vs the 0.05 goal. `--no-stream` switch turns it off.
+| workload                        | wall    | RTF     |
+|---------------------------------|---------|---------|
+| API baseline (torchscript lane) | 3.52 s  | 0.0353  |
+| API optimized, 99.6 s audio     | **99 ms** | **0.0010** |
+| API optimized, 1 h audio        | 5.3 s   | **0.0015** |
+|
 
-## Real-bundle run (gigaspeech/conv2d6)
+
+
+## Overview
+
+One python frontend, two module backends : PyTorch torch modules on
+NVIDIA GB10/H800, MLX modules on Apple M3.
+
+No/Less CPU : Every stage of the streaming chunk loop stays on the accelerator and is driven by custom JIT kernels.
+
+| Platform                      | Python frontend | Kernel path                                     | Chunk execution                        |
+|-------------------------------|-----------------|-------------------------------------------------|----------------------------------------|
+| H800 (Hopper, sm_90)          | torch modules   | CUDA `csrc/` FP8 scaled WASP wgmma              | eager / piecewise / fused CUDA graphs  |
+| DGX-Spark (GB10, sm_121a)     | torch modules   | CUDA `csrc/dgx/` NVFP4 WASP / multi stage mma   | eager / piecewise / fused CUDA graphs  |
+| Mac Studio (M5/M3 Ultra/Mini) | mlx modules     | Metal (`mx.fast.metal_kernel`)                  | mx.compile segments + `async_eval`     |
+
+#### Hardware Requirements
+
+- Hopper SuperPod : CUDA 12.8/13.0, driver > 580 (compatible for CUDA13)
+- DGX Spark : CUDA 13.0
+- M5/M3 Ultra : mlx-lm, mlx latest, details will be updated soon.
+- Torch 2.10
+- Triton (3.7+)
+
+## How we do auio transcribing ?
+
+Follow the gold standard GPU fbank from Kaldi, we implemented GPU JIT kernels such as `power_mel_log`, `CMVN`, `pwlin` (conv1), `fused layer norm` and so on so forth on DGX spark.
+
+Before sending audio chunk to Went Conformer on GPU, we unified continous (fbank) Tokenizer against discret codebook tokenier with compaction in AR model.
+
+CTC greedy decode is also playing an important role for peak performance. Traditional implementation transfer to tokens in and out from GPU frequent remove duplicates and we maximize the duration on GPU and use piecewise graph capture to accleration computation.
+
+#### Usage:
+
+**Transcribe API**
 
 ```python
 from veloxvoice import Velox
-v = Velox.load("/path/to/model-dir")           # giant: final.zip/units.txt/train.yaml hosted by HF
-session = v.new_session()
+vx = Velox.load("/path/to/model-dir")          # giant: final.zip/units.txt/train.yaml hosted by HF, e.g. : data/models/asr_model in our usage case
+session = vx.new_session()
 session.accept(pcm_chunk)                      # streaming of raw PCM
 print(session.text())                          # real lyrics (LLM text matched by WER/Torchscript ref)
 ```
 
-* `ts_archive.py` reads quantized `final.zip` without the torchscript interpreter (very aarch64-friendly: FBGEMM has no ARM dispatch);
-* gigaspeech's `Conv2dSubsampling6` native modules with paired streaming caches are included;
-* production lane: `use_graphs="eager"` (documented asymmetric vs `cuda-graph` pending).
+**Using ASR Model for short audio**
 
-## Health
+```bash
+ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd  )"
 
-Dev box = DGX-Spark (GB10 aarch64), dev env: torch 2.13+cu130, triton 3.7.1,
-apache-tvm-ffi, mlx 0.32.1[cuda]; conda env `velox`.
-**pytest: 13 passed, 1 skip** (MLX-Metal path — see AGENTS.md "known platform
-issue": MLX-CUDA13 nvrtc blocked upstream; validated target = Apple Silicon).
+audio=$ROOT/speaker_test/meeting-test.wav
+model=$ROOT/data/models/asr_model
 
-Verified kernels (cuda ↔ gluon ↔ torch refs): silu_glu, dw_causal_conv1d,
-layernorm, power_mel_log, chunk_rel_pos_attn, dgx_mxfp4_gemm (bit-exact fp4
-decode-ref, all shapes 128³ … 4096×4096×16384).
+python $ROOT/tools/bench_wenet.py \
+         --model-dir $model --audio $audio --use-jit
+```
+
+**Using ASR Model for long (1 hour) audio**
+
+```bash
+
+ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd  )"
+
+# WENET_INPROC_MAX_CALLS:
+#   9999/unset : encode per-spans in-process (multi-threaded CUDA-stream
+#                 pipeline; frontend runs once, no subprocess spawn cost)
+#   3          : fresh subprocess workers for spans>3 calls
+export WENET_INPROC_MAX_CALLS=9999
+
+# WENET_PAR_WORKERS (subprocess path only; the threaded in-proc path ignores it):
+#   serial : one worker processes ALL span groups sequentially (default;
+#             workers share one GPU, so parallel CUDA contexts only contend)
+#   <N>    : run N span-groups concurrently (helps only if workers are
+#             CPU/IO-bound, not GPU-bound)
+# export WENET_PAR_WORKERS=serial
+
+
+audio=$ROOT/speaker_test/meeting-test.wav
+model=$ROOT/data/models/asr_model
+
+python $ROOT/tools/bench_wenet_multi_worker.py \
+         --iters 3 \
+         --model-dir $model --audio $audio --use-jit --fp16
+```
+
+**Uasing AR ASR Model**
+
+For the moment we mainly use Conformer (trained from scatch) to transcribe audio, we will add AR model support soon.
+
+## Feature set
+
+**Kernels** (`veloxvoice/kernels/`):
+
+- csrc/:
+  - `velox_power_mel_log` : extremely unbalanced GEMM in long duration audio task
+  - `velox_layernorm`, `velox_silu_glu`, `velox_depthwise_causal_conv1d` : opt w/ NoC
+  - `velox_chunk_rel_pos_attn` : masked rel-pos multi-head attention (opt WIP)
+  - `velox_fused_qkv` : small-m fused GEMV
+- csrc/dgx/ (DGX-Spark sm_121a):
+  - **WASP 1p2c packed nvfp4/mxfp4 GEMM** with NoC and warp level m16n8k64
+    `mma.sync.aligned.kind::mxf4nvf4.block_scale` with e8m0 scales.
+- triton3_7/: gluon references for the same ops.
+- csrc/mlx/: Metal urban suite:
+  - `depthwise-causal-conv1d`, `silu_glu`, `power_mel_log` : metal kernel support
+  - **sub-1bit streamk GEMM** multi stage XOR matrix-multiply acculation (mma)
+  - **stream GEMM** multi stage metal simdgroup mma
+  - layernorm
+  - chunk_rel_pos_attn
+**Graphs**: eager / piecewise CUDA graph / MLX metal-graph
+
+**Tokenizer**: TextTokenizer (units.txt mapping for CTC), VoiceTokenizer
+(continuous + FSQ-discrete per chunk).
+
 
 ## Performance (GB10 today, randomized weights, LibriVox 6 min, chunks of 160 ms)
 
@@ -120,54 +162,41 @@ decode-ref, all shapes 128³ … 4096×4096×16384).
 | ffmpeg decode+resample (mp3 → 16 kHz mono) | ~0.6 s per 360 s (RTF ~1.7e-3) |
 | chunk wall, eager backend                  | 5.33 ms / chunk                |
 | chunk wall, `"cuda-graph"` (piecewise)     | 2.43 ms p50                    |
-| chunk wall, `"cuda-graph-fused"`           | 2.43 ms p50 / 2.50 ms/chunk     |
+| chunk wall, `"cuda-graph-fused"`           | 2.43 ms p50 / 2.50 ms/chunk    |
 | end-to-end, eager                          | 13.1 s → **RTF 0.0406**        |
-| end-to-end, fused graph                    | **6.22 s → RTF 0.0173**        |
+| end-to-end, fused graph                    | 6.22 s → **RTF 0.0173**        |
 | goal (user target)                         | 18 s → **achieved (≈ 3× margin)** |
 
-Compute floor on this box (not yet reached): weights-traffic per chunk ≈ 60 MB
-at ~273 GB/s ≈ 0.22 ms → headroom remains for the layered work items
-(aggregated runtime currently ~2.4 ms/chunk, ~11× above the floor; dominant costs
-measured by torch.profiler: cublas TN GEMVs 45% / elementwise 20% / custom
-LayerNorm 4%).
+Also see report from [flash-float-jit-kerenl](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33).
 
-dgx_mxfp4_gemm: **100 TFLOPS @ 2048³ single-precision accum** (vs 9.1 ms python
-side reference; bit-exact). First-V1 wall — leaves ldmatrix + 2/4-bank swizzle +
-real e8m0 scale-tensor staging for the upcoming phase.
+## Install
 
-## SOL of WeNet — remaining road
+Device-agnostic deps live in `requirements/common.txt`; the accelerator stack
+is per-device and referenced with `-r`:
 
-1. **fp16/half stage** for the encoder (elementwise + layernorms already
-   kernelized; halves elementwise/cache byte traffic) — the largest data-path
-   compute win available without IIT numbers (piecewise draw shows elementwise
-   ~20%).
-2. **Fused QKV custom kernel** integration into the conformer layer (replaces
-   36 cublas calls per chunk by 12; gate with harness).
-3. **NVFP4 mainstream** (the dgx path already bit-verified) — the AR/TTS model
-   codec-weight brand; weights must load/quantize with e8m0 scale tensors (next
-   milestone, not yet wired into the ASR loop).
-4. **Apple side**: M3 Studio run — MLX-box compile of the mlx/ + dgx-style metal
-   variants; ANE overlap state (mlx-lm#617 seam).
-5. SAN-launch synchronization trims (`cuda-graph-fused`, contiguous-carrying
-   state in pool-static buffers), perf notes in tests/xfail registry.
-
-Given the current 6.22s/360s = RTF 0.0173 with fp32 random weights and eager
-dispatch alone, RTF 0.01 is the practical next checkpoint (≈ 3.6 s for 6 min of
-audio); predictions, not yet reached.
-
-## Repo map
-
+```bash
+pip install -r requirements/requirements-cuda.txt   # DGX Spark / H800 (torch cu130 wheels)
+pip install -r requirements/requirements-mlx.txt    # Apple Silicon
 ```
-veloxvoice/
-  runtime/device.py      sm90/sm121a/metal detection
-  audio/                 fbank GPU frontends, ingest, units.txt text tokenizer
-  vocoding/              VoiceTokens, FSQ
-  kernels/               csrc/{,dgx,mlx} + jit/ + triton3_7/ + ops/
-  graphs/                policy, cuda_runner (sglang port), metal_runner, chunk pipeline
-  models/wenet/          config, native torch nn.Module, MLX conformer, converters
-  stream/                streaming CTC greedy + recognizer
-  api.py                 Velox.load / StreamingSession
-examples/, tools/        stream_wav, bench_rtf, kernel_harness, model converters
-.opencode/skills/        nvidia-jit-kernel + metal-jit-kernel dev loops
-AGENTS.md               conventions, gotchas, known issues
-```
+
+## Accuracy (WER/CER, 100 samples per set — tools/bench_accuracy.py)
+
+| dataset (50 samples)                 | WER%  | CER%  | cpWER% (oracle spk) |
+|--------------------------------------|-------|-------|---------------------|
+| AMI IHM (English, headset)           | 36.20 | 30.37 | 24.59 |
+| AMI SDM (English, far single mic)    | 68.94 | 59.62 | 42.08 |
+| AISHELL-4 (Mandarin meetings)        | 28.67 | 28.67 | 25.01 |
+| AliMeeting (Mandarin far-field, 8k)  | 16.45 | 16.45 | 12.70 |
+| Cantonese (cantonese_daily)          | 23.26 | 23.26 | 23.26 |
+
+<picture>
+  <img alt="velox-voice-conformer-accuracy" src="benchmark/accuracy/accuracy_benchmark.png">
+</picture>
+
+We follow the [VibeVoice](https://github.com/microsoft/VibeVoice) project to produce the benchmark.
+
+English sets are out-of-domain for this WenETSpeech-trained model; cpWER with
+oracle speaker attribution recovers most of the meeting-set gap.
+
+TF32 `mma.sync` **truncates** (RZ) unconverted fp32 operands may attributed to
+the mis-recognition (see tests/kernels/test_power_mel_log.py).

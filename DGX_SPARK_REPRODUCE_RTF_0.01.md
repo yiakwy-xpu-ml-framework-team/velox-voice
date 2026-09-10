@@ -35,7 +35,7 @@ python tools/kernel_harness.py verify chunk_rel_pos_attn
 python tools/kernel_harness.py verify dgx_mxfp4_gemm --shape 2048,2048,2048
 ```
 
-## 3. Reproduce the 6-minute RTF result
+## 3. Reproduce the 6-minute RTF result (streaming lane)
 
 ```bash
 # (a) audio: wikimedia commons librivox chapter (~12 min; we only use 6)
@@ -55,6 +55,60 @@ Expected on a clean GB10:
 eager:             ~13.1 s wall → RTF ~0.0406
 cuda-graph-fused:  ~5.8 s wall  → RTF ~0.0160 (p50 chunk ~2.4 ms per 160 ms)
 ```
+
+## 3b. Reproduce the OFFLINE full-context result (the 0.001 lane)
+
+Public API only — no direct model use:
+
+```bash
+# 99.6 s meeting audio through Velox.load + vx.transcribe (native fp16 lane)
+python examples/transcribe.py --model-dir data/models/asr_model \
+    --audio speaker_test/meeting-test.wav --no-stream
+# → RTF ≈ 0.0021 first call, ≈ 0.0010 steady (load warms the max span shape)
+
+# 1-hour audio, end-to-end through the benchmark harness (iters=3, warm median)
+bash tools/bench_wenet_multi_worker.sh          # RTF 0.0015 (warm median)
+
+# GPU-aware dispatch is automatic (torch.cuda.device_count()):
+#   1 GPU  → in-process software-pipelined span encoding (measured fastest;
+#            multi-process only contends on one GPU: 9 workers = 19.9 s vs 5.3 s)
+#   N GPUs → subprocess workers, one wave per device (CUDA_VISIBLE_DEVICES pin)
+```
+
+What the lane does (veloxvoice/api.py `_transcribe_offline`): on `load()` a
+native `WenetConformerASR` is built next to the torchscript bundle — velox JIT
+kernels (fused_layernorm / silu_glu), TF32 matmul, fp16 autocast — and warmed
+at the largest span shape. Spans are software-pipelined on one stream with a
+fixed-shape GPU collapse (sentinel -1; semantics = CtcGreedyDecoder); there is
+no per-span sync. Historical checkpoints: torchscript lane 0.0353 → SDPA+TF32
+0.0037 → fp16 pipeline 0.0015 → steady API 0.0010.
+
+Known knobs: `VELOXVOICE_DISABLE_OFFLINE=1` skips the torchscript bundle;
+`--use-torchscript` forces the slow fallback lane.
+
+## 3c. Accuracy benchmark (WER / CER / cpWER)
+
+```bash
+python tools/bench_accuracy.py --samples 100          # AMI IHM/SDM, AISHELL-4,
+                                                      # AliMeeting, Cantonese
+```
+
+Writes per-dataset JSON + a bar chart under `benchmark/accuracy/`. Current
+numbers (100 samples/set) are in README "Accuracy". Metric gotcha that cost us
+a day: `mma.sync …tf32` **truncates** unconverted fp32 operands (10-bit
+mantissa, RZ) — kernel references must emulate that rounding, and offline-lane
+verify must compare jit-on vs jit-off with a small divergence budget
+(≤ max(3, 0.1%) ops), not exact equality.
+
+## 3d. Piecewise CUDA graph — measured verdict for the offline lane
+
+`tools/bench_piecewise_graph.py` captures full-span CUDA graphs per length
+bucket. Result on GB10: graph replay is SLOWER than the pipelined eager path
+(125.7 ms vs 95.8 ms at exact shape; padding waste at coarser buckets), and the
+captured stream disagreed with eager (407/406 tokens) — TVM-FFI velox kernels
++ SDPA under capture need a per-kernel audit before this lane is trustworthy.
+Consistent with sglang PR #10062 ("no improvement for tokens ≥ 4096"). Keep
+graphs on the streaming chunk lane (`cuda-graph-fused`), not offline spans.
 
 ## 4. Reproduce the NVFP4 (mxfp4) DGX-Spark GEMM result
 
