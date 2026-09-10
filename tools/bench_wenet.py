@@ -111,7 +111,27 @@ def _spans_for(feats, max_mel, pcm):
     n = feats.shape[0]
     if n <= max_mel:
         return [(0, n)]
-    from veloxvoice.api import _low_energy_spans
+
+    # from veloxvoice.api import _low_energy_spans
+    def _low_energy_spans(n_frames: int, max_frames: int, db) -> list[tuple[int, int]]:
+        """Split [0, n_frames) into spans of <= max_frames, cutting each span at the
+        lowest-energy point found in a backward search window (<= 30 s) from the
+        nominal cut, so segment edges fall inside pauses rather than mid-word."""
+        import numpy as np
+
+        spans = []
+        a = 0
+        while n_frames - a > max_frames:
+            nominal = a + max_frames
+            lo = max(a + max_frames // 4, nominal - 3000)  # search back <= 30 s
+            hi = min(nominal, len(db) - 1)
+            cut = lo + int(np.argmin(db[lo:hi])) if hi > lo else nominal
+            cut = max(cut, a + 1)
+            spans.append((a, cut))
+            a = cut
+        spans.append((a, n_frames))
+        return spans
+
     from veloxvoice.audio.vad_energy import frame_energy_db
 
     db = frame_energy_db(
