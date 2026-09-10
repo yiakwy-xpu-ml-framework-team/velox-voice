@@ -7,7 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from veloxvoice.kernels.helper_cuda import cuda_build_flags
+from veloxvoice.kernels.helper_cuda import cuda_build_flags, cuda_driver_ldflags
 
 KERNELS_ROOT = Path(__file__).resolve().parent
 CSRC = KERNELS_ROOT / "csrc"
@@ -73,7 +73,7 @@ def build_cuda_module(
             cuda_sources=list(sources),
             functions=[],  # entry points are self-exported via TVM_FFI_DLL_EXPORT_TYPED_FUNC
             extra_cuda_cflags=flags,
-            extra_ldflags=[f"-L/usr/lib/aarch64-linux-gnu", "-lcuda"],
+            extra_ldflags=cuda_driver_ldflags(),
             build_directory=str(build_dir),
         )
     finally:
