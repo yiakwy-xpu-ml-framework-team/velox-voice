@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#4C1D95"/>
+      <stop offset="0.55" stop-color="#6D28D9"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="fg" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.55" stop-color="#FFFFFF"/>
+      <stop offset="0.80" stop-color="#FDE68A"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#bg)"/>
+  <rect x="27" y="27" width="458" height="458" rx="109" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="3"/>
+  <g stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" opacity="0.88"><line x1="128.0" y1="84.0" x2="128.0" y2="92.0"/><line x1="147.7" y1="77.2" x2="147.7" y2="98.8"/><line x1="167.4" y1="71.6" x2="167.4" y2="104.4"/><line x1="187.1" y1="68.5" x2="187.1" y2="107.5"/><line x1="206.8" y1="68.3" x2="206.8" y2="107.7"/><line x1="226.5" y1="71.1" x2="226.5" y2="104.9"/><line x1="246.2" y1="76.4" x2="246.2" y2="99.6"/><line x1="265.8" y1="83.2" x2="265.8" y2="92.8"/><line x1="285.5" y1="77.9" x2="285.5" y2="98.1"/><line x1="305.2" y1="72.2" x2="305.2" y2="103.8"/><line x1="324.9" y1="68.7" x2="324.9" y2="107.3"/><line x1="344.6" y1="68.2" x2="344.6" y2="107.8"/><line x1="364.3" y1="70.7" x2="364.3" y2="105.3"/><line x1="384.0" y1="75.7" x2="384.0" y2="100.3"/></g>
+  <line x1="64" y1="432" x2="176" y2="432" stroke="#F59E0B" stroke-width="16" stroke-linecap="round" opacity="0.92"/><line x1="92" y1="466" x2="204" y2="466" stroke="#F59E0B" stroke-width="14" stroke-linecap="round" opacity="0.55"/>
+  <g transform="translate(70.0,185.1)">
+    <path d="M36.36,0.00 L79.38,0.00 L97.33,122.44 L167.26,0.00 L210.24,0.00 L113.55,165.88 L62.53,165.88 L36.36,0.00 Z M307.41,81.24 L346.94,165.88 L302.40,165.88 L275.70,109.21 L225.18,165.88 L180.42,165.88 L255.97,81.24 L217.89,0.00 L262.58,0.00 L287.55,53.43 L335.10,0.00 L380.00,0.00 L307.41,81.24 Z" fill="url(#fg)"/>
+  </g>
+</svg>
