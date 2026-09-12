@@ -65,7 +65,7 @@ No/Less CPU : Every stage of the streaming chunk loop stays on the accelerator a
 - Torch 2.10
 - Triton (3.7+)
 
-## How we do auio transcribing ?
+## How do we transcribe audio ?
 
 Follow the gold standard GPU fbank from Kaldi, we implemented GPU JIT kernels such as `power_mel_log`, `CMVN`, `pwlin` (conv1), `fused layer norm` and so on so forth on DGX spark.
 
