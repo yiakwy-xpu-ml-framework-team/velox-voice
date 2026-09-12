@@ -151,7 +151,7 @@ For the moment we mainly use Conformer (trained from scatch) to transcribe audio
   - layernorm
   - chunk_rel_pos_attn
 
-Also see report from [flash-float-jit-kerenl](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33).
+Also see report from [flash-float-jit-kernel](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33).
 
 **Graphs**: eager / piecewise CUDA graph / MLX metal-graph
 
