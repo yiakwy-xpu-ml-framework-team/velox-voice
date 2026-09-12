@@ -151,6 +151,8 @@ For the moment we mainly use Conformer (trained from scatch) to transcribe audio
   - layernorm
   - chunk_rel_pos_attn
 
+Also see report from [flash-float-jit-kerenl](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33).
+
 **Graphs**: eager / piecewise CUDA graph / MLX metal-graph
 
 **Tokenizer**: TextTokenizer (asr_model/units.txt mapping for CTC), VoiceTokenizer
@@ -172,10 +174,6 @@ frontend, JIT kernels; 6 spans at the pos_pe window):
 | CTC logp + greedy decode                      | 113.0 ms                              |
 | end-to-end wall (decode+frontend+encode+CTC)  | 3218.09 ms → **total RTF 0.0044**     |
 
-Cross-platform: H800 is ~5.2× faster on the encoder (0.0004 vs 0.0022 RTF),
-~2× faster end-to-end (0.0022 vs 0.0044 RTF); both platforms produce identical
-tokens (n=548).
-
 #### Hopper (NVIDIA H800, sm_90, CUDA 12.8, torch 2.10.0+cu128) on Sep 10 2026 — LibriVox 12 min
 
 `tools/bench_wenet.py --audio /tmp/librivox.mp3 --use-jit` (offline lane, bf16 frontend,
@@ -190,10 +188,9 @@ spans at the pos_pe window):
 | CTC logp + greedy decode                      | 5.7 ms                             |
 | end-to-end wall (decode+frontend+encode+CTC)  | 1574.89 ms → **total RTF 0.0022**  |
 
-DGX-Spark (GB10, sm_121a) streaming-lane numbers (chunk wall / cuda-graph) are
-tracked separately in [DGX_SPARK_REPRODUCE_RTF_0.01.md](DGX_SPARK_REPRODUCE_RTF_0.01.md).
-
-Also see report from [flash-float-jit-kerenl](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33).
+Cross-platform: H800 is ~5.2× faster on the encoder (0.0004 vs 0.0022 RTF),
+~2× faster end-to-end (0.0022 vs 0.0044 RTF); both platforms produce identical
+tokens (n=548).
 
 ## Install
 
@@ -202,6 +199,8 @@ is per-device and referenced with `-r`:
 
 ```bash
 pip install -r requirements/requirements-cuda.txt   # DGX Spark / H800 (torch cu130 wheels)
+
+# NOTE (yiakwy) : pending to update
 pip install -r requirements/requirements-mlx.txt    # Apple Silicon
 ```
 
