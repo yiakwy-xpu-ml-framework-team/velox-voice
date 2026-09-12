@@ -78,8 +78,9 @@ CTC greedy decode is also playing an important role for peak performance. Tradit
 **Transcribe API**
 
 ```python
+# NOTE (yiakwy) : veloxvoice.api, veloxvoice.stream are pending, use the API belows
 from veloxvoice import Velox
-vx = Velox.load("/path/to/model-dir")          # giant: final.zip/units.txt/train.yaml hosted by HF, e.g. : data/models/asr_model in our usage case
+vx = Velox.load("/path/to/model-dir")          # giant: final.zip / asr_model.pt / units.txt / train.yaml hosted by HF, e.g. : data/models/asr_model in our usage case
 session = vx.new_session()
 session.accept(pcm_chunk)                      # streaming of raw PCM
 print(session.text())                          # real lyrics (LLM text matched by WER/Torchscript ref)
@@ -138,6 +139,7 @@ For the moment we mainly use Conformer (trained from scatch) to transcribe audio
   - `velox_layernorm`, `velox_silu_glu`, `velox_depthwise_causal_conv1d` : opt w/ NoC
   - `velox_chunk_rel_pos_attn` : masked rel-pos multi-head attention (opt WIP)
   - `velox_fused_qkv` : small-m fused GEMV
+  - `flash-float-jit-kernel : distRadixTopK` : ctc produce [T, 14128] logits (see our asr_model/units.txt), our exact match topk is good to deal with this kink sequence length, though it was originally designed for DSV32/DSV4 lighting indexer topk.
 - csrc/dgx/ (DGX-Spark sm_121a):
   - **WASP 1p2c packed nvfp4/mxfp4 GEMM** with NoC and warp level m16n8k64
     `mma.sync.aligned.kind::mxf4nvf4.block_scale` with e8m0 scales.
@@ -148,23 +150,48 @@ For the moment we mainly use Conformer (trained from scatch) to transcribe audio
   - **stream GEMM** multi stage metal simdgroup mma
   - layernorm
   - chunk_rel_pos_attn
+
 **Graphs**: eager / piecewise CUDA graph / MLX metal-graph
 
-**Tokenizer**: TextTokenizer (units.txt mapping for CTC), VoiceTokenizer
+**Tokenizer**: TextTokenizer (asr_model/units.txt mapping for CTC), VoiceTokenizer
 (continuous + FSQ-discrete per chunk).
 
+## Performance of common test file in English (not the proprietory 1 hour Candonese audio)
 
-## Performance (GB10 today, randomized weights, LibriVox 6 min, chunks of 160 ms)
+#### DGX Spark (GB10, sm_121a) on Sep 10 2026 — LibriVox 12 min
 
-| Metric                                     | Value                          |
-|--------------------------------------------|--------------------------------|
-| ffmpeg decode+resample (mp3 → 16 kHz mono) | ~0.6 s per 360 s (RTF ~1.7e-3) |
-| chunk wall, eager backend                  | 5.33 ms / chunk                |
-| chunk wall, `"cuda-graph"` (piecewise)     | 2.43 ms p50                    |
-| chunk wall, `"cuda-graph-fused"`           | 2.43 ms p50 / 2.50 ms/chunk    |
-| end-to-end, eager                          | 13.1 s → **RTF 0.0406**        |
-| end-to-end, fused graph                    | 6.22 s → **RTF 0.0173**        |
-| goal (user target)                         | 18 s → **achieved (≈ 3× margin)** |
+Same workload and command as the Hopper table above
+(`tools/bench_wenet.py --audio /tmp/librivox.mp3 --use-jit`, offline lane, bf16
+frontend, JIT kernels; 6 spans at the pos_pe window):
+
+| Metric                                        | Value                                 |
+|-----------------------------------------------|---------------------------------------|
+| ffmpeg decode + resample (mp3 → 16 kHz mono)  | 723.62 s, 6 segments                  |
+| verify: JIT-ON ≡ JIT-OFF                      | tokens_same=True, max\|Δenc\|=0.00000 |
+| encoder wall (6 segments)                     | 1614.71 ms → encoder RTF **0.0022**   |
+| CTC logp + greedy decode                      | 113.0 ms                              |
+| end-to-end wall (decode+frontend+encode+CTC)  | 3218.09 ms → **total RTF 0.0044**     |
+
+Cross-platform: H800 is ~5.2× faster on the encoder (0.0004 vs 0.0022 RTF),
+~2× faster end-to-end (0.0022 vs 0.0044 RTF); both platforms produce identical
+tokens (n=548).
+
+#### Hopper (NVIDIA H800, sm_90, CUDA 12.8, torch 2.10.0+cu128) on Sep 10 2026 — LibriVox 12 min
+
+`tools/bench_wenet.py --audio /tmp/librivox.mp3 --use-jit` (offline lane, bf16 frontend,
+JIT kernels: fused power-mel-log + layernorm + silu_glu; long audio segmented into 6
+spans at the pos_pe window):
+
+| Metric                                        | Value                              |
+|-----------------------------------------------|------------------------------------|
+| ffmpeg decode + resample (mp3 → 16 kHz mono)  | 723.62 s, 6 segments               |
+| verify: JIT-ON ≡ JIT-OFF                      | tokens_same=True, max\|Δenc\|=0.00000 |
+| encoder wall (6 segments)                     | 309.52 ms → encoder RTF **0.0004** |
+| CTC logp + greedy decode                      | 5.7 ms                             |
+| end-to-end wall (decode+frontend+encode+CTC)  | 1574.89 ms → **total RTF 0.0022**  |
+
+DGX-Spark (GB10, sm_121a) streaming-lane numbers (chunk wall / cuda-graph) are
+tracked separately in [DGX_SPARK_REPRODUCE_RTF_0.01.md](DGX_SPARK_REPRODUCE_RTF_0.01.md).
 
 Also see report from [flash-float-jit-kerenl](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33).
 
