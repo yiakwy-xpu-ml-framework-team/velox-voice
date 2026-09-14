@@ -11,37 +11,37 @@
 
 </div>
 
-This repository is porting our "Flash Float JIT Kernels" into audio task. Besides practical conformer (see below) with JIT kerenls, we are also supporting frontier audio tasks with AR models with JIT kernels from frontier audio lab.
+This repository is porting our "Flash Float JIT Kernels" into audio tasks. Besides practical conformer (see below) with JIT kerenls, we are also supporting frontier AR models with JIT kernels from frontier audio lab.
 
 <h2 id="highlight"> Highlight </h2>
 
-- Sep 10 2026, [🔥 Transcribing 1 hour candonese audio within few seconds on DGX Spark , RTF 0.001 (x1000 acceleration) 🚀 with almost good Condonese Recoginition 🎯!](#Transcribing-1-hrs-audio-in-seconds-on-dgx-spark)
+- Sep 10 2026, [🔥 Transcribing 1-hour candonese audio within few seconds on DGX Spark , RTF 0.001 (x1000 acceleration) 🚀 with almost good Condonese Recoginition 🎯!](#Transcribing-1-hrs-audio-in-seconds-on-dgx-spark)
 
-<h2 id="Transcribing-1-hrs-audio-in-seconds-on-dgx-spark">🔥 Transcribing 1 hour audio in seconds on DGX Spark</h2>
+<h2 id="Transcribing-1-hrs-audio-in-seconds-on-dgx-spark">🔥 Transcribing 1-hour audio in seconds on DGX Spark</h2>
 
-**Transcribing 1 hour audio into few seconds**
+**Transcribing 1-hour audio into few seconds**
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/fd26e9dc-9830-4d6a-a243-0d17ae425254" width="60%"> </video>
 </div>
 
-Priro VeloxVoice, long audio transcribing with wenet alike model (Conformerencoder + CTC) suffers from extremely computation imbalance.
+Prior VeloxVoice, transcribing long audio with wenet alike model (Conformerencoder + CTC) suffers from extremely computation imbalance.
 
-Take the [power mel log](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33) for example usually has matrix shape of **[T, M]**, where **M** is **80** dependent on the audio sampling rate and **T** is framees depending on the duration of the audio. As a result for a long audio, traditional torch gemm does not handle this computation characteristics efficiently.
+Take the [power mel log](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33) for example, the task typically involves a matrix of shape **[T, M]**, where **M** is **80** and depends on the audio sampling rate, while **T** represents the number of frames and depends on the duration of the audio. As a result, for a long audio inputs, traditional torch GEMM does not handle this computation characteristics efficiently.
 
-We identified the issue and propose solutions with fuse JIT kernel operations tackle that bottlenect.
+We identified the issue and proposed solutions with fused JIT kernel operations to address that bottlenect.
 
-In DGX Spark, our latest results shows that we can achive RTF **0.0015** for 1 hour audio, while on Hopper platform, RTF **0.0003** is achieved.
+In DGX Spark, our latest results show that we can achive an RTF **0.0015** for 1-hour audio, while on Hopper platform, an RTF **0.0003** is achieved.
 
-This restul fundamental changed streaming logics of previous audio task, where **velox voice** is good for.
+This restul fundamental changed the streaming logics of previous audio tasks, where **velox voice** is good for.
 
 
 | workload                    | GPU              | wall       | RTF        |
 |-----------------------------|------------------|------------|------------|
 | baseline (torchscript lane) | dgx spark (GB10) |   3.52 s   | 0.0353     |
 | 99.6 s audio                | dgx spark (GB10) | **99 ms**  | **0.0010** |
-| multi worker, 1 h audio     | dgx spark (GB10) |   5.3  s   | **0.0015** |
-| multi worker, 1 h audio     | Hopper superPod  | **997 ms** | **0.0003** |
+| multi worker, 1-h audio     | dgx spark (GB10) |   5.3  s   | **0.0015** |
+| multi worker, 1-h audio     | Hopper superPod  | **997 ms** | **0.0003** |
 
 
 ## Overview
@@ -69,9 +69,9 @@ No/Less CPU : Every stage of the streaming chunk loop stays on the accelerator a
 
 Follow the gold standard GPU fbank from Kaldi, we implemented GPU JIT kernels such as `power_mel_log`, `CMVN`, `pwlin` (conv1), `fused layer norm` and so on so forth on DGX spark.
 
-Before sending audio chunk to Went Conformer on GPU, we unified continous (fbank) Tokenizer against discret codebook tokenier with compaction in AR model.
+Before sending audio chunk to Went Conformer on GPU, we unified continous (fbank) Tokenizer with the discret one with compaction via codebook for AR models.
 
-CTC greedy decode is also playing an important role for peak performance. Traditional implementation transfer to tokens in and out from GPU frequent remove duplicates and we maximize the duration on GPU and use piecewise graph capture to accleration computation.
+CTC greedy decode also plays an important role in achieving peak performance. Traditional implementation freqeuntly transfer tokens in and out from GPU to remove duplicates, and we maximize the duration of the data on GPU and use piecewise graph capture to acclerate computation.
 
 #### Usage:
 
@@ -98,7 +98,7 @@ python $ROOT/tools/bench_wenet.py \
          --model-dir $model --audio $audio --use-jit
 ```
 
-**Using ASR Model for long (1 hour) audio**
+**Using ASR Model for long (1-hour) audio**
 
 ```bash
 
@@ -160,7 +160,7 @@ Also see report from [flash-float-jit-kernel](https://github.com/yiakwy-xpu-ml-f
 
 ## Performance of common test
 
-Instead of the proprietory 1 hour Candonese audio, we also try the common availabel mp3 file in English.
+Instead of the proprietory 1-hour Candonese audio, we also try the common availabel mp3 file in English.
 
 #### DGX Spark (GB10, sm_121a) on Sep 10 2026 — LibriVox 12 min
 
@@ -226,7 +226,7 @@ pip install -r requirements/requirements-mlx.txt    # Apple Silicon
 We follow the [VibeVoice](https://github.com/microsoft/VibeVoice) project to produce the benchmark.
 
 English sets are out-of-domain for this WenETSpeech-trained model; cpWER with
-oracle speaker attribution recovers most of the meeting-set gap.
+oracle (perfect) speaker attribution recovers most of the gap on the meeting set.
 
-TF32 `mma.sync` **truncates** (RZ) unconverted fp32 operands may attributed to
+TF32 `mma.sync` **truncates** (RZ) unconverted fp32 operands, which may be attributed to
 the mis-recognition (see tests/kernels/test_power_mel_log.py).
