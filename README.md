@@ -75,60 +75,109 @@ CTC greedy decode also plays an important role in achieving peak performance. Tr
 
 #### Usage:
 
-**Transcribe API**
+**Python API (full-context, benchmark-equivalent)**
 
 ```python
-# NOTE (yiakwy) : veloxvoice.api, veloxvoice.stream are pending, use the API belows
 from veloxvoice import Velox
-vx = Velox.load("/path/to/model-dir")          # giant: final.zip / asr_model.pt / units.txt / train.yaml hosted by HF, e.g. : data/models/asr_model in our usage case
-session = vx.new_session()
-session.accept(pcm_chunk)                      # streaming of raw PCM
-print(session.text())                          # real lyrics (LLM text matched by WER/Torchscript ref)
+
+vx = Velox.load("/path/to/model-dir")   # e.g. data/models/asr_model
+result = vx.transcribe_pcm(pcm_16k)    # mono float32 PCM, [-1, 1]
+
+print(result.text)
+print(result.rtf)
+
+# For chunked uploads, keep pooling enough audio before invoking the encoder.
+for partial in vx.transcribe_pcm_iter(pcm_chunks, pool_seconds=20):
+    print(partial.text)
 ```
 
-**Using ASR Model for short audio**
+`Velox.load` loads `WenetConformerASR`, enables the fused JIT path by default,
+and exposes only the public API lane. It does not return the model object as the
+normal application-facing API.
+
+**CLI transcription**
 
 ```bash
-ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/" && pwd  )"
+# Full-context transcription
+python examples/transcribe.py   --model-dir data/models/asr_model   --audio speaker_test/meeting-test.wav
 
-audio=$ROOT/speaker_test/meeting-test.wav
-model=$ROOT/data/models/asr_model
+# Streaming pooled partials
+python examples/transcribe.py   --model-dir data/models/asr_model   --audio speaker_test/meeting-test.wav   --stream --pool-seconds 20
 
-python $ROOT/tools/bench_wenet.py \
-         --model-dir $model --audio $audio --use-jit
+# API timing harness
+python tools/bench_velox_api.py   --model-dir data/models/asr_model   --audio speaker_test/meeting-test.wav   --iters 5
 ```
 
 **Using ASR Model for long (1-hour) audio**
+**SGLang-Omni-compatible ASR server**
 
 ```bash
-
-ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/" && pwd  )"
-
-# WENET_INPROC_MAX_CALLS:
-#   9999/unset : encode per-spans in-process (multi-threaded CUDA-stream
-#                 pipeline; frontend runs once, no subprocess spawn cost)
-#   3          : fresh subprocess workers for spans>3 calls
-export WENET_INPROC_MAX_CALLS=9999
-
-# WENET_PAR_WORKERS (subprocess path only; the threaded in-proc path ignores it):
-#   serial : one worker processes ALL span groups sequentially (default;
-#             workers share one GPU, so parallel CUDA contexts only contend)
-#   <N>    : run N span-groups concurrently (helps only if workers are
-#             CPU/IO-bound, not GPU-bound)
-# export WENET_PAR_WORKERS=serial
-
-
-audio=$ROOT/speaker_test/meeting-test.wav
-model=$ROOT/data/models/asr_model
-
-python $ROOT/tools/bench_wenet_multi_worker.py \
-         --iters 3 \
-         --model-dir $model --audio $audio --use-jit --fp16
+python -m veloxvoice.server \
+  --model-dir data/models/asr_model \
+  --host 0.0.0.0 --port 8000
 ```
 
-**Uasing AR ASR Model**
+Third-party clients can discover the service at:
 
-For the moment we mainly use Conformer (trained from scatch) to transcribe audio, we will add AR model support soon.
+- `GET /docs` — Swagger UI
+- `GET /openapi.json` — machine-readable schema
+- `GET /api` — compact route and quickstart index
+- `GET /client` — optional browser test client
+- `GET /` — redirect to `/docs`
+
+Routes:
+
+| route | purpose |
+|---|---|
+| `GET /health` | SGLang-Omni readiness probe |
+| `GET /v1/models` | model discovery |
+| `GET /sitemap.xml` | XML sitemap |
+| `POST /v1/audio/transcriptions` | multipart transcription, including `stream=true` SSE |
+| `POST /v1/audio/uploads` | upload-only staging; returns an `audio_id` for deferred transcription |
+| `POST /v1/audio/translations` | explicit HTTP 400 (translation is unsupported) |
+| `WS   /v1/audio/ws` | chunked streaming and pooled partials |
+
+Example:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F 'model=asr_model' \
+  -F 'language=en' \
+  -F 'response_format=json' \
+  -F 'file=@audio.mp3'
+```
+
+Streaming example:
+
+```bash
+curl -N -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F 'file=@audio.mp3' \
+  -F 'response_format=json' \
+  -F 'stream=true'
+```
+
+The transcription endpoint accepts `file`, `model`, `language`, `prompt`,
+`response_format`, `temperature`, `repetition_penalty`, `max_new_tokens`, and
+`stream`. Non-stream response formats are `json`, `text`, `verbose_json`,
+`srt`, and `vtt`; streaming supports `json` and `text`. `json` returns
+`{"text": "...", "usage": {"type": "duration", "seconds": N}}`. With
+`stream=true`, it emits `transcript.text.delta`, one authoritative
+`transcript.text.done`, and `data: [DONE]`.
+
+Uploaded REST/WS audio is retained under `logs/user_data/YYYYMMDD/`, with a
+sidecar `.json` result file when transcription completes. The optional browser
+client shows upload elapsed time in seconds, and changes the transcription label
+to **Transcribed** with total wall/audio/server time after completion.
+
+The streaming WebSocket can upload while the server decodes and transcribes.
+Live mode decouples browser upload from ffmpeg drain, disables WebSocket
+per-message compression, and defaults the browser pool to 5 seconds for lower
+first-partial latency. The stream session pools decoded PCM into 5-30 second
+windows and emits each completed window immediately, then emits one aggregate
+final result. For 99.6s meeting audio on H800 with CUDA graphs, live mode
+normally reaches its first partial in about **0.15s** and completes in about
+**0.24s**; the direct benchmark path is about **0.0003-0.0007** RTF depending
+on iteration.
 
 ## Feature set
 
@@ -204,6 +253,7 @@ is per-device and referenced with `-r`:
 
 ```bash
 pip install -r requirements/requirements-cuda.txt   # DGX Spark / H800 (torch cu130 wheels)
+pip install -e '.[server]'                          # FastAPI/WebSocket ASR service (also needs ffmpeg)
 
 # NOTE (yiakwy) : pending to update
 pip install -r requirements/requirements-mlx.txt    # Apple Silicon

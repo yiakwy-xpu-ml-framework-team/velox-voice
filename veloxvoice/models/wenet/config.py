@@ -22,7 +22,6 @@ class WeNetConfig:
     right_context_frames: int = 6  # conv2d-4 subsampling lookahead (frames)
     decoding_chunk_size: int = 16  # mel frames per streaming chunk
     causal_conv: bool = True  # conv_module: rolling left-cache causal (u2++ streaming)
-    # vs symmetric padding=(K-1)//2 window (offline "unstreaming" U2)
 
     @property
     def subsampling(self) -> int:

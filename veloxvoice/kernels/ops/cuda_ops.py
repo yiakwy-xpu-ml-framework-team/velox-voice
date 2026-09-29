@@ -10,6 +10,8 @@ import functools
 
 import tvm_ffi
 
+# TODO (yiakwy) : add compilation guard
+
 
 @functools.cache
 def _audio_mod():
@@ -127,10 +129,10 @@ def power_mel_log(spec, mel, cmvn_mean, cmvn_istd):
             )
         return out
 
-    return _power_mel_log_cublas(spec, mel, cmvn_mean, cmvn_istd)
+    return _power_mel_log(spec, mel, cmvn_mean, cmvn_istd)
 
 
-def _power_mel_log_cublas(spec, mel, cmvn_mean, cmvn_istd):
+def _power_mel_log(spec, mel, cmvn_mean, cmvn_istd):
     """cuBLAS fast path: power → matmul → log. No padding overhead."""
     import torch
 
@@ -142,6 +144,7 @@ def _power_mel_log_cublas(spec, mel, cmvn_mean, cmvn_istd):
     return feat
 
 
+# TODO (yiakwy) : repalced with _audio_mod().power_log_mxfp4
 def power_mel_log_mxfp4(
     spec, mel_codes, mel_scales, cmvn_mean, cmvn_istd, F_padded, M_padded
 ):
@@ -228,12 +231,24 @@ def silu_glu(x, out=None):
 
 @functools.cache
 def _attn_mod():
+    import os
+
     from veloxvoice.kernels.utils import CSRC, build_cuda_module
 
+    # NOTE (yiakwy) : tuned for DGX Spark
+    warps = int(os.environ.get("VELOXVOICE_FQKV_SIMT_WARPS", "4"))
+    streaming = int(os.environ.get("VELOXVOICE_FQKV_SIMT_STREAMING_W", "1"))
+
+    suffix = f"_w{warps}_s{streaming}"
+
     return build_cuda_module(
-        "attn_ops",
+        f"attn_ops{suffix}",
         ("velox_chunk_rel_pos_attn.cu", "velox_fused_qkv.cu"),
         ("chunk_rel_pos_attn", "fused_qkv"),
+        extra_cuda_cflags=(
+            f"-DFQKV_SIMT_WARPS={warps}",
+            f"-DFQKV_SIMT_STREAMING_W={streaming}",
+        ),
     )
 
 
@@ -288,10 +303,281 @@ def fused_qkv(x, w, bias, out=None):
     return out
 
 
-def reference_fused_qkv(x, w, bias):
+def reference_fused_qkv(x, wqkv, bias_qkv):
     import torch.nn.functional as F
 
-    return F.linear(x, w, bias)
+    return F.linear(x, wqkv, bias_qkv)
+
+
+# TODO (yiakwy) : add support for DGX Spark
+def _pwlin_mod(tile_m=128, tile_n=128):
+    """pwlin+glu fused GEMM: hopper wgmma implementation.
+
+    Small/M-bound shapes use [64,64] to raise CTA count; large shapes use
+    [128,128] for wider WGMMA fragments.
+    """
+    import os
+
+    from veloxvoice.kernels.helper_cuda import cuda_arch_str
+    from veloxvoice.kernels.utils import CSRC, build_cuda_module
+
+    if (tile_m, tile_n) not in ((64, 64), (128, 64), (128, 128)):
+        raise ValueError("pwlin-glu supports tiles 64x64, 128x64, 128x128")
+
+    arch = cuda_arch_str()
+    override = "9.0a" if arch.startswith("9.0") else None
+
+    env_stages = os.environ.get("VELOXVOICE_PWLIN_NSTAGES", "4")
+
+    return build_cuda_module(
+        f"pwlin_glu_ops_tile{tile_m}x{tile_n}",
+        ("velox_pwlin_glu_wgmma_bf16.cu",),
+        ("pwlin_glu",),
+        extra_cuda_cflags=(
+            "-O3",
+            "--use_fast_math",
+            "-std=c++17",
+            f"-I{CSRC}",
+            f"-DPWLIN_TILE_M={tile_m}",
+            f"-DPWLIN_TILE_N={tile_n}",
+            f"-DPWLIN_NSTAGES={env_stages}",
+        )
+        + _pdl_cflags(),
+        arch_override=override,
+        extra_headers=(
+            "hopper/arch/thread/pdl_sm90.h",
+            "hopper/arch/thread/thread_barrier.h",
+            "hopper/arch/tma/mbarrier_sm90.h",
+            "hopper/arch/tma/tma_sm90.h",
+            "hopper/arch/warpgroup/warpgroup_barrier.h",
+            "hopper/arch/wgmma/gmma_sm90.h",
+            "hopper/fragment/wgmma_accumulator_bf16.h",
+            "hopper/block/sched.h",
+            "hopper/block/wasp_producer.h",
+            "hopper/block/pwlin_glu_block_1p2c.h",
+        ),
+    )
+
+
+def pwlin_glu(x, w, b, out=None):
+    """out = glu(x @ w^T + b), bf16, M >= 64."""
+    import os
+
+    import torch
+
+    M = x.reshape(-1, x.shape[-1]).shape[0]
+    if not (x.is_cuda and x.dtype == torch.bfloat16 and M >= 64):
+        return None
+    out = (
+        out
+        if out is not None
+        else torch.empty(
+            x.shape[:-1] + (w.shape[0] // 2,), device=x.device, dtype=x.dtype
+        )
+    )
+    override = os.environ.get("VELOXVOICE_PWLIN_TILE")
+    if override:
+        tile_m, tile_n = map(int, override.lower().split("x"))
+    else:
+        # [64,64] maximizes CTAs through M=1024; [128,64] still fills the
+        # device through M=2048; [128,128] avoids a second wave above that.
+        if M <= 1024:
+            tile_m, tile_n = 64, 64
+        elif M <= 2048:
+            tile_m, tile_n = 128, 64
+        else:
+            tile_m, tile_n = 128, 128
+    try:
+        with tvm_ffi.use_torch_stream():
+            _pwlin_mod(tile_m=tile_m, tile_n=tile_n).pwlin_glu(
+                x.reshape(-1, x.shape[-1]).contiguous(),
+                w.contiguous(),
+                b.contiguous(),
+                out.reshape(-1, out.shape[-1]).contiguous(),
+            )
+    except Exception:
+        return None
+    return out
+
+
+def _pdl_cflags():
+    """VELOXVOICE_ENABLE_PDL=1 enalbes PDL on sm90a, see hopper/arch/thread/pdl_sm90.h."""
+    import os
+
+    if os.environ.get("VELOXVOICE_ENABLE_PDL") == "1":
+        return ("-DVELOXVOICE_ENABLE_PDL=1",)
+    return ()
+
+
+def _fused_qkv_wgmma_mod(n256=False, stream_k=0, n192=False):
+    """JIT the production fused-qkv Hopper GEMM."""
+    import os
+
+    from veloxvoice.kernels.helper_cuda import cuda_arch_str
+    from veloxvoice.kernels.utils import CSRC, build_cuda_module
+
+    arch = cuda_arch_str()
+    override = "9.0a" if arch.startswith("9.0") else None
+
+    # Harnessing integration
+    probe = ()
+    if n192:
+        probe = probe + ("-DFQKV_TILE_N=192",)
+    elif n256:
+        probe = probe + ("-DFQKV_TILE_N=256",)
+    else:
+        raise ValueError("fused-qkv requires FQKV_TILE_N=192 or 256")
+
+    if stream_k:
+        probe = probe + (f"-DFQKV_STREAM_K={stream_k}",)
+    if os.environ.get("VELOXVOICE_FQKV_PHASE_TRACE") == "1":
+        probe = probe + ("-DFQKV_PHASE_TRACE=1",)
+
+    return build_cuda_module(
+        f"fused_qkv_wgmma_ops"
+        f"{'_n192' if n192 else ''}{'_n256' if n256 else ''}"
+        f"{'_streamk' if stream_k else ''}"
+        f"{'_phase' if os.environ.get('VELOXVOICE_FQKV_PHASE_TRACE') == '1' else ''}",
+        ("velox_fused_qkv_wgmma_bf16.cu",),
+        ("fused_qkv_wgmma", "fused_qkv_wgmma_streamk", "fused_qkv_wgmma_phase_trace"),
+        extra_cuda_cflags=("-O3", "--use_fast_math", "-std=c++17", f"-I{CSRC}")
+        + _pdl_cflags()
+        + probe,
+        arch_override=override,
+        extra_headers=(
+            "hopper/arch/thread/pdl_sm90.h",
+            "hopper/arch/thread/thread_barrier.h",
+            "hopper/arch/tma/mbarrier_sm90.h",
+            "hopper/arch/tma/tma_sm90.h",
+            "hopper/arch/warpgroup/warpgroup_barrier.h",
+            "hopper/arch/wgmma/gmma_sm90.h",
+            "hopper/fragment/wgmma_accumulator_bf16.h",
+            "hopper/fragment/fused_qkv_tile_bf16.h",
+            "hopper/block/sched.h",
+            "hopper/block/wasp_producer.h",
+            "hopper/block/streamk_reduce.h",
+            "hopper/block/fused_qkv_block_1p2c.h",
+        ),
+    )
+
+
+def _split_k_for(M):
+    """JIT split-K selection: low batch -> higher split_k to fill SMs.
+    Reads VELOXVOICE_SPLIT_K override; otherwise heuristic by M."""
+    import os
+
+    override = os.environ.get("VELOXVOICE_SPLIT_K")
+    if override:
+        return int(override)
+    if M <= 128:
+        return 4
+    if M <= 512:
+        return 2
+    return 1
+
+
+def fused_qkv_wgmma(x, w, b, out=None):
+    """Fused qkv, bf16, sm_90a: out = x @ w^T + b.
+
+    Returns None when the current arch/shape is unsupported (caller falls
+    back to F.linear).  N192/N256 is selected in the fragment; stream-K is an
+    opt-in cluster lane and currently supports N256.
+    """
+    import os
+
+    import torch
+
+    M = x.reshape(-1, x.shape[-1]).shape[0]
+    N3 = w.shape[0]
+    K = x.shape[-1]
+    if not (
+        x.is_cuda and x.dtype == torch.bfloat16 and M >= 64 and N3 == 1536 and K == 512
+    ):
+        return None
+    out = out if out is not None else torch.empty(M, N3, device=x.device, dtype=x.dtype)
+
+    use_n192 = (
+        os.environ.get("VELOXVOICE_FQKV_N192", "1") == "1"
+        if "VELOXVOICE_FQKV_N192" in os.environ
+        else M <= 2048 or M >= 3072
+    )
+
+    stream_k = int(os.environ.get("VELOXVOICE_FQKV_STREAM_K", "0"))
+
+    if stream_k:
+        mod = _fused_qkv_wgmma_mod(n256=True, stream_k=stream_k, n192=False)
+
+        with tvm_ffi.use_torch_stream():
+            mod.fused_qkv_wgmma_streamk(
+                x.reshape(-1, x.shape[-1]).contiguous(),
+                w.contiguous(),
+                b.contiguous(),
+                out,
+                stream_k,
+            )
+        return out
+
+    mod = _fused_qkv_wgmma_mod(
+        n256=not use_n192,
+        n192=use_n192,
+    )
+
+    try:
+        with tvm_ffi.use_torch_stream():
+            mod.fused_qkv_wgmma(
+                x.reshape(-1, x.shape[-1]).contiguous(),
+                w.contiguous(),
+                b.contiguous(),
+                out,
+            )
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        return None
+    return out
+
+
+def _pack_mod():
+    from veloxvoice.kernels.utils import CSRC, build_cuda_module
+
+    return build_cuda_module(
+        "qkv_pack_ops",
+        ("velox_qkv_pack.cu",),
+        ("qkv_pack",),
+        extra_cuda_cflags=(f"-I{CSRC}",) + _pdl_cflags(),
+        extra_headers=("hopper/arch/pdl_sm90.h",),
+    )
+
+
+def qkv_pack(qkv, p0, pos_u, pos_v, scale):
+    """Single-pass attention fold pack (full-context lane, bf16).
+
+    qkv [T, 3d] (t-major q|k|v GEMM output); p0 [T, d] (lp(pos_emb) raw);
+    pos_u/pos_v [h, dk]; scale float.
+    -> (q2, k2, v2) each [h, T, 2dk] bf16 contiguous — SDPA-ready.
+    """
+    import torch
+
+    T, d3 = qkv.shape
+    d = d3 // 3
+    h = pos_u.shape[0]
+    dk = d // h
+    q2 = torch.empty(h, T, 2 * dk, device=qkv.device, dtype=qkv.dtype)
+    k2 = torch.empty_like(q2)
+    v2 = torch.empty_like(q2)
+    with tvm_ffi.use_torch_stream():
+        _pack_mod().qkv_pack(
+            qkv.contiguous(),
+            p0.contiguous(),
+            pos_u.contiguous(),
+            pos_v.contiguous(),
+            q2,
+            k2,
+            v2,
+            float(scale),
+        )
+    return q2, k2, v2
 
 
 def _build_dgx_mod(

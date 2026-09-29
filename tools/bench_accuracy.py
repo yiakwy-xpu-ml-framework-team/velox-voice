@@ -1,19 +1,20 @@
 """ASR accuracy benchmark: WER / CER / cpWER across public meeting + dialect sets.
 
 Datasets (utterance-level scoring, single-speaker segments):
-  - AMI IHM   (edinburghcstr/ami, ihm, eval)        individual headset mics, English
-  - AMI SDM   (edinburghcstr/ami, sdm1, eval)       single distant mic, English
-  - AISHELL-4 (AISHELL/AISHELL-4, test)             Mandarin meetings (far mic)
-  - AliMeeting( playwithmino/alimeeting-eval-8k )   Mandarin far-field meetings
+  - AMI IHM   (edinburghcstr/ami, ihm, eval)                individual headset mics, English
+  - AMI SDM   (edinburghcstr/ami, sdm1, eval)               single distant mic, English
+  - AISHELL-4 (AISHELL/AISHELL-4, test)                     Mandarin meetings (far mic)
+  - AliMeeting( playwithmino/alimeeting-eval-8k )           Mandarin far-field meetings
   - CommonVoice yue (mozilla-foundation/common_voice_17_0)  Cantonese read speech
 
-Inspired by VibeVoice's ASR-scored evaluation harness: transcribe -> normalize
--> edit-distance metrics vs references. cpWER is the speaker-attributed
-(concatenated permutation) variant; with ASR-only output every scored segment
-is single-speaker, so cpWER reduces to utterance WER (labeled cpWER-oracle).
+Inspired by VibeVoice's ASR-scored evaluation harness:
+  transcribe -> normalize -> edit-distance metrics vs references.
+
+cpWER is hence the speaker-attributed variant, while with ASR-only output (no diarization), every scored segment
+represents a single speaker. As a result, cpWER reduces to utterance WER (labeled cpWER-oracle).
 
 Usage:
-  python tools/bench_accuracy.py --samples 50 [--datasets ami_ihm,ami_sdm,aishell4,alimeeting,cv_yue]
+  python tools/bench_accuracy.py --samples 100 [--datasets ami_ihm,ami_sdm,aishell4,alimeeting,cv_yue]
 """
 
 from __future__ import annotations
@@ -28,19 +29,20 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
 
 from wer_metrics import cer, cpwer, normalize, wer  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+from veloxvoice.audio.text_tokenizer import TextTokenizer
+
 OUT_DIR = ROOT / "benchmark" / "accuracy"
 HF_TOKEN = (
-    open("/home/yiakwang/token.txt").read().strip()
-    if os.path.exists("/home/yiakwang/token.txt")
+    open(ROOT / "logs" / "token.txt").read().strip()
+    if os.path.exists(ROOT / "logs" / "token.txt")
     else None
 )
-
 
 # ---------------------------------------------------------------------------
 # Transcription (VeloxVoice pipeline: frontend + fp16 autocast encoder + CTC)
@@ -48,6 +50,9 @@ HF_TOKEN = (
 
 _ASR = None
 _FE = None
+
+# NOTE (yiakwy) : disable the duplication collapse to match the refrence results
+_DEDUP = False
 
 
 def _get_asr(model_dir: str):
@@ -60,11 +65,12 @@ def _get_asr(model_dir: str):
         )
 
         cfg = load_config(model_dir)
-        m = WenetConformerASR(model_dir, device="cuda")
-        m.set_jit(True)
-        m.set_fp16(True)
-        _ASR = m
-        _FE_CLS_FE = (FrontendConfig, TorchGpuFrontend, cfg.input_dim)
+        model = WenetConformerASR(model_dir, device="cuda")
+        model.set_jit(True)
+        model.set_fp16(True)
+
+        _ASR = model
+        _FE = (FrontendConfig, TorchGpuFrontend, cfg.input_dim)
     return _ASR
 
 
@@ -81,34 +87,42 @@ def transcribe_pcm(pcm: np.ndarray, sr: int, model_dir: str) -> str:
         t = AF.resample(t, sr, 16000)
         pcm = t.numpy()
 
-    m = _get_asr(model_dir)
+    model = _get_asr(model_dir)
+
     fe = TorchGpuFrontend(
-        FrontendConfig(sample_rate=16000, num_mel_bins=m.cfg.input_dim), "cuda"
+        FrontendConfig(sample_rate=16000, num_mel_bins=model.cfg.input_dim), "cuda"
     )
+
     pcm = np.ascontiguousarray(pcm.astype(np.float32))
     feats = torch.cat([fe.accept(pcm), fe.flush()], dim=0)
+
     if feats.shape[0] < 8:
         return ""
+
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        enc = m.encode_utterance(feats[None])
-    logp = m.ctc_logp(enc)[0]
+        enc = model.encode_utterance(feats[None])
+    logp = model.ctc_logp(enc)[0]
     ids = logp.argmax(-1)
+
     prev = torch.cat([ids.new_zeros(1), ids[:-1]])
+
     keep = (ids != 0) & (ids != prev)
     kept = ids[keep.nonzero().squeeze(-1)].cpu().tolist()
-    # collapse blank-separated repeats like CtcGreedyDecoder.push_ids
-    out, last = [], 0
-    for t in kept:
-        t = int(t)
-        if t != last and t != 0:
-            out.append(t)
-        last = t
-    from veloxvoice.audio.text_tokenizer import TextTokenizer
+    if not _DEDUP:
+        out = kept
+    else:
+        # legacy dedup
+        out, last = [], 0
+        for t in kept:
+            t = int(t)
+            if t != last and t != 0:
+                out.append(t)
+            last = t
 
-    tok = getattr(m, "_text_tok", None)
+    tok = getattr(model, "_text_tok", None)
     if tok is None:
         tok = TextTokenizer(os.path.join(model_dir, "units.txt"))
-        m._text_tok = tok
+        model._text_tok = tok
     return tok.ids_to_text(out).strip()
 
 
@@ -295,6 +309,7 @@ LOADERS = {
     "alimeeting_headset": lambda n: load_alimeeting(n, "eval_n100_headset"),
     "alimeeting_far": lambda n: load_alimeeting(n, "eval_n100"),
     "cantonese": load_cantonese,
+    "cv_yue": load_cantonese,
 }
 
 
@@ -377,7 +392,15 @@ def main():
         "--datasets", default="ami_ihm,ami_sdm,aishell4,alimeeting,cantonese"
     )
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--dedup",
+        action="store_true",
+        help="enable the legacy extra CTC dedup pass",
+    )
     args = ap.parse_args()
+
+    global _DEDUP
+    _DEDUP = bool(args.dedup)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     names = [s.strip() for s in args.datasets.split(",") if s.strip()]

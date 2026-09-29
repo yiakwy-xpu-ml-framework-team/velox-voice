@@ -14,7 +14,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from veloxvoice.kernels.helper_cuda import velox_arch_str
 from veloxvoice.kernels.ops import dgx_mxfp4_gemm
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or velox_arch_str() != "12.1a",
+    reason="DGX mxfp4 kernels require CUDA sm_121a",
+)
 from veloxvoice.models.wenet.nvfp4_linear import (
     CODE_LUT,
     _encode_codes,
@@ -55,7 +61,6 @@ def torch_matmul_ref(xq, wq, sa_u8, sb_u8):
     return raw * row_s * col_s  # [M, N] fp32
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 class TestDgxMxfp4Gemm:
 
     @pytest.mark.parametrize(
