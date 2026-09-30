@@ -8,8 +8,6 @@ import time
 
 import torch
 
-sys.path.insert(0, "/home/yiakwang/workspace/Github/VeloxVoice")
-
 from veloxvoice.kernels.ops.cuda_ops import (
     _dequantize_to_bf16,
     dgx_mxfp4_gemm,

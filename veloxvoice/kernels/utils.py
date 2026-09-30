@@ -9,6 +9,8 @@ from pathlib import Path
 
 from veloxvoice.kernels.helper_cuda import cuda_build_flags, cuda_driver_ldflags
 
+# NOTE (yiakwy) : follow sglang style to compute jit kernel cache key
+
 KERNELS_ROOT = Path(__file__).resolve().parent
 CSRC = KERNELS_ROOT / "csrc"
 BUILD_CACHE = Path.home() / ".cache" / "veloxvoice" / "tvmffi"
@@ -40,6 +42,7 @@ def build_cuda_module(
     functions: tuple[str, ...],
     extra_cuda_cflags: tuple[str, ...] = (),
     arch_override: str | None = None,
+    extra_headers: tuple[str, ...] = (),
 ):
     """Compile csrc/*.cu files into one TVM-FFI module (disk-cached, process-cached).
 
@@ -52,6 +55,7 @@ def build_cuda_module(
     from veloxvoice.kernels import helper_cuda
 
     sources = tuple(read_source(f"csrc/{f}") for f in csrc_files)
+    key_extra = tuple(read_source(f"csrc/{h}") for h in extra_headers)
     if arch_override:
         flags = list(extra_cuda_cflags)  # replace arch flags entirely
         arch = arch_override
@@ -59,7 +63,7 @@ def build_cuda_module(
         flags = cuda_build_flags() + list(extra_cuda_cflags)
         arch = helper_cuda.cuda_arch_str()
 
-    key = source_key(name, list(sources), flags, arch)
+    key = source_key(name, list(sources) + list(key_extra), flags, arch)
     build_dir = BUILD_CACHE / f"{name}-{key}"
     build_dir.mkdir(parents=True, exist_ok=True)
 

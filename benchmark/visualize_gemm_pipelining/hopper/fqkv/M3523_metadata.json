@@ -1,0 +1,43 @@
+{
+  "M": 3523,
+  "K": 512,
+  "N": 1536,
+  "variant": "N192",
+  "stage_count": 4,
+  "error_max": 0.007810115814208984,
+  "ours_us": 15.397798269987105,
+  "cublas_us": 12.670678552240133,
+  "ratio": 0.8228889825721002,
+  "smids": [
+    124,
+    126
+  ],
+  "cta_count": 2,
+  "phase_summary": {
+    "producer_wait_empty": {
+      "count": 123,
+      "median_us": 0.288,
+      "mean_us": 0.527609756097561
+    },
+    "tma_issue_to_consumer_ready": {
+      "count": 128,
+      "median_us": 1.344,
+      "mean_us": 2.11875
+    },
+    "wgmma": {
+      "count": 128,
+      "median_us": 0.288,
+      "mean_us": 0.296
+    },
+    "epilogue_issue": {
+      "count": 16,
+      "median_us": 1.76,
+      "mean_us": 1.77
+    },
+    "store_release": {
+      "count": 14,
+      "median_us": 3.776,
+      "mean_us": 3.762285714285714
+    }
+  }
+}

@@ -66,11 +66,11 @@ class TorchWenEtModel:
             return 5000
 
     def encode_utterance(self, feats):
-        """Whole-utterance, full-context encode (offline lane).
+        """Whole-utterance, full-context encode (batch lane).
 
         feats: [1, T, F] device tensor of kaldi fbank with NO externally-applied
         CMVN (the bundle's encoder.global_cmvn handles it). One-shot full
-        attention = the bundle's offline training regime.
+        attention = the bundle's paged training regime.
         """
         backend = self.backend
         with backend.inference_mode():

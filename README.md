@@ -75,15 +75,44 @@ CTC greedy decode also plays an important role in achieving peak performance. Tr
 
 #### Usage:
 
-**Transcribe API**
+**Transcribe API (full-context)**
 
 ```python
-# NOTE (yiakwy) : veloxvoice.api, veloxvoice.stream are pending, use the API belows
 from veloxvoice import Velox
-vx = Velox.load("/path/to/model-dir")          # giant: final.zip / asr_model.pt / units.txt / train.yaml hosted by HF, e.g. : data/models/asr_model in our usage case
-session = vx.new_session()
-session.accept(pcm_chunk)                      # streaming of raw PCM
-print(session.text())                          # real lyrics (LLM text matched by WER/Torchscript ref)
+
+vx = Velox.load("/path/to/model-dir")   # giant: final.zip / asr_model.pt / units.txt / train.yaml hosted by HF, e.g. : data/models/asr_model in our usage case
+
+# Old API
+# session = vx.new_session()
+# session.accept(pcm_chunk)              # streaming of raw PCM
+# print(session.text())                  # real lyrics (LLM text matched by WER/Torchscript ref)
+
+# New API
+result = vx.transcribe_pcm(pcm_16k)    # mono float32 PCM, [-1, 1]
+
+print(result.text)
+print(result.rtf)
+
+# For chunked uploads, keep pooling enough audio before invoking the encoder.
+for partial in vx.transcribe_pcm_iter(pcm_chunks, pool_seconds=20):
+    print(partial.text)
+```
+
+`Velox.load` loads `WenetConformerASR`, enables the fused JIT path by default,
+and exposes only the public API lane. It does not return the model object as the
+normal application-facing API.
+
+**CLI transcription**
+
+```bash
+# Full-context transcription
+python examples/transcribe.py     --model-dir data/models/asr_model   --audio speaker_test/meeting-test.wav
+
+# Streaming pooled partials
+python examples/transcribe.py     --model-dir data/models/asr_model   --audio speaker_test/meeting-test.wav   --stream --pool-seconds 20
+
+# API timing harness
+python tools/bench_velox_api.py   --model-dir data/models/asr_model   --audio speaker_test/meeting-test.wav   --iters 5
 ```
 
 **Using ASR Model for short audio**
@@ -126,9 +155,52 @@ python $ROOT/tools/bench_wenet_multi_worker.py \
          --model-dir $model --audio $audio --use-jit --fp16
 ```
 
-**Uasing AR ASR Model**
+**SGLang-Omni-compatible ASR server**
 
-For the moment we mainly use Conformer (trained from scatch) to transcribe audio, we will add AR model support soon.
+```bash
+python -m veloxvoice.server \
+  --model-dir data/models/asr_model \
+  --host 0.0.0.0 --port 8000
+```
+
+Third-party clients can discover the service at:
+
+- `GET /docs` — Swagger UI
+- `GET /openapi.json` — machine-readable schema
+- `GET /api` — compact route and quickstart index
+- `GET /client` — optional browser test client
+- `GET /` — redirect to `/docs`
+
+Routes:
+
+| route | purpose |
+|---|---|
+| `GET /health` | SGLang-Omni readiness probe |
+| `GET /v1/models` | model discovery |
+| `GET /sitemap.xml` | XML sitemap |
+| `POST /v1/audio/transcriptions` | multipart transcription, including `stream=true` SSE |
+| `POST /v1/audio/uploads` | upload-only staging; returns an `audio_id` for deferred transcription |
+| `POST /v1/audio/translations` | explicit HTTP 400 (translation is unsupported) |
+| `WS   /v1/audio/ws` | chunked streaming and pooled partials |
+
+Example:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F 'model=asr_model' \
+  -F 'language=en' \
+  -F 'response_format=json' \
+  -F 'file=@audio.mp3'
+```
+
+Streaming example:
+
+```bash
+curl -N -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F 'file=@audio.mp3' \
+  -F 'response_format=json' \
+  -F 'stream=true'
+```
 
 ## Feature set
 
@@ -139,7 +211,8 @@ For the moment we mainly use Conformer (trained from scatch) to transcribe audio
   - `velox_layernorm`, `velox_silu_glu`, `velox_depthwise_causal_conv1d` : opt w/ NoC
   - `velox_chunk_rel_pos_attn` : masked rel-pos multi-head attention (opt WIP)
   - `velox_fused_qkv` : small-m fused GEMV
-  - `flash-float-jit-kernel : distRadixTopK` : ctc produce [T, 14128] logits, our exact match topk is good to deal with this kind of sequence length
+  - `flash-float-jit-kernel` libs
+    - `distRadixTopK` : ctc produce [T, 14128] logits, our exact match topk is good to deal with this kind of sequence length
 - csrc/dgx/ (DGX-Spark sm_121a):
   - **WASP 1p2c packed nvfp4/mxfp4 GEMM** with NoC and warp level m16n8k64
     `mma.sync.aligned.kind::mxf4nvf4.block_scale` with e8m0 scales.
@@ -204,6 +277,7 @@ is per-device and referenced with `-r`:
 
 ```bash
 pip install -r requirements/requirements-cuda.txt   # DGX Spark / H800 (torch cu130 wheels)
+pip install -e '.[server]'                          # FastAPI/WebSocket ASR service (also needs ffmpeg)
 
 # NOTE (yiakwy) : pending to update
 pip install -r requirements/requirements-mlx.txt    # Apple Silicon

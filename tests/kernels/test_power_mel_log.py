@@ -19,7 +19,18 @@ from __future__ import annotations
 import pytest
 import torch
 
+from veloxvoice.kernels.helper_cuda import velox_arch_str
 from veloxvoice.kernels.ops import power_mel_log, reference_power_mel_log
+
+
+def _real_mel_fbank_available() -> bool:
+    try:
+        import torchaudio  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Reference implementations
@@ -145,6 +156,9 @@ class TestPowerMelLogBf16:
         out = power_mel_log(spec, mel, mean, istd)
         _assert_close(out, ref)
 
+    @pytest.mark.skipif(
+        not _real_mel_fbank_available(), reason="torchaudio is unavailable/broken"
+    )
     def test_real_mel_fbank_matches_fp32(self):
         """Production regime: non-negative filterbank -> no cancellation -> fp32-grade."""
         for T, F, M in [(128, 257, 80), (256, 513, 80)]:
@@ -197,6 +211,9 @@ class TestPowerMelLogBf16:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 class TestDenseLinearPrecision:
 
+    @pytest.mark.skipif(
+        velox_arch_str() != "12.1a", reason="mxfp4 kernel requires CUDA sm_121a"
+    )
     def test_mxfp4_forward(self):
         from veloxvoice.models.wenet.torch_conformer import DenseLinear
 
@@ -234,6 +251,9 @@ class TestDenseLinearPrecision:
         diff = (out - ref).abs().max().item()
         assert diff == 0.0, f"fp32 should be exact, diff={diff}"
 
+    @pytest.mark.skipif(
+        velox_arch_str() != "12.1a", reason="mxfp4 kernel requires CUDA sm_121a"
+    )
     def test_mxfp4_3d_input(self):
         from veloxvoice.models.wenet.torch_conformer import DenseLinear
 

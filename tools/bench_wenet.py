@@ -37,18 +37,62 @@ _AUDIO_EXTS = (
 )
 
 
-def read_audio(p):
+_RESAMPLE_CACHE = {}
+
+
+def _resample16k_gpu(x, sr, device):
+    """48k->16k, 32k->16k via windowed-sinc polyphase on GPU."""
+    import math
+
+    if sr == 16000:
+        return x.to(device)
+
+    # TODO (yiakwy) : add gpu fused jit kernel
+    g = math.gcd(int(sr), 16000)
+    up, down = 16000 // g, sr // g
+    if up != 1:
+        return None
+
+    key = (down, str(device))
+    kern = _RESAMPLE_CACHE.get(key)
+    if kern is None:
+        taps = 32 * down + 1
+        n = torch.arange(taps, dtype=torch.float64) - (taps - 1) / 2
+        h = torch.sinc(0.92 * n / down) * torch.kaiser_window(
+            taps, periodic=False, beta=8.6, dtype=torch.float64
+        )
+        _RESAMPLE_CACHE[key] = kern = (h / h.sum()).to(device).float()
+    pad = (kern.numel() - 1) // 2
+    xp = torch.nn.functional.pad(x.to(device).view(1, 1, -1), (pad, pad))
+    y = torch.nn.functional.conv1d(xp, kern.view(1, 1, -1), stride=down)[0, 0]
+    n_out = int(len(x) * 16000 / sr)
+    return y[:n_out] if len(y) >= n_out else y
+
+
+def read_audio(p, device="cpu"):
     """wav/mp3/flac/m4a/... audio -> 16kHz mono audio resampled by ffmpeg."""
+
     import subprocess
 
     try:
         with wave.open(p, "rb") as w:
-            sr, ch = w.getframerate(), w.getnchannels()
-            if sr == 16000 and ch == 1:
+            sr, ch, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
+
+            # NOTE (yiakwy) : sampled via GPU
+            if width == 2 and ch == 1:
                 pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-                return pcm.astype(np.float32) / 32768.0
-    except Exception:
+                x = torch.from_numpy(pcm.astype(np.float32) / 32768.0)
+
+                y = _resample16k_gpu(
+                    x, sr, "cuda" if device.startswith("cuda") else device
+                )
+                if y is not None:
+                    return y
+                # uncommon ratio: fall through to the generic ffmpeg path
+    except wave.Error:
         pass
+
+    # NOTE (yiakwy) : default 16 k smapled via CPU
     raw = subprocess.run(
         [
             "ffmpeg",
@@ -150,7 +194,7 @@ def verify_correctness(fe, args, suffix=".wav"):
     if wav0 is not None:
 
         # read audio
-        pcm0 = read_audio(wav0)
+        pcm0 = read_audio(wav0, device=args.device)
         if args.seconds:
             pcm0 = pcm0[: int(args.seconds * 16000)]
         feats0 = torch.cat([fe.accept(pcm0), fe.flush()], dim=0)
@@ -168,13 +212,13 @@ def verify_correctness(fe, args, suffix=".wav"):
             )
             feats0 = feats0[:max_mel]
 
-        d_on = CtcGreedyDecoder()
+        d_on = CtcGreedyDecoder(dedup=args.dedup)
         d_on.push_logp(m_on.ctc_logp(m_on.encode_utterance(feats0[None]))[0])
 
         # NOTE (yiakwy) w/o JIT kernel
         m_off = WenetConformerASR(args.model_dir, device=args.device)
         m_off.set_jit(False)
-        d_off = CtcGreedyDecoder()
+        d_off = CtcGreedyDecoder(dedup=args.dedup)
         d_off.push_logp(m_off.ctc_logp(m_off.encode_utterance(feats0[None]))[0])
 
         same_tokens = d_on.tokens == d_off.tokens
@@ -201,12 +245,24 @@ def main():
     ap.add_argument("--audio", default=None)
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument(
+        "--dedup",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="legacy extra CTC dedup pass (drops doubled symbols); default OFF",
+    )
     ap.add_argument("--iters", type=int, default=5, help="defaults to 5")
     ap.add_argument(
         "--use-jit",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="velox JIT kernel",
+    )
+    ap.add_argument(
+        "--use-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="encode+ctc_logp graph captured per span",
     )
     ap.add_argument(
         "--precision",
@@ -230,6 +286,15 @@ def main():
     m = WenetConformerASR(args.model_dir, device=args.device)
     m.set_jit(args.use_jit)
     m.set_precision(args.precision)
+
+    if args.use_graphs:
+        m.enable_graphs()
+
+    with torch.inference_mode():
+        for nfr in (256, 2000, 8000):
+            m.encode_utterance(torch.zeros(1, nfr, cfg.input_dim, device=args.device))
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize()
 
     # NOTE (yiakwy) : prepare audio and transcripts
     jobs = []
@@ -255,10 +320,38 @@ def main():
     tot_e = tot_w = 0.0
     elapse_enc_list, enc_rtf_list, tot_wall = [], [], 0.0
     for name, path, ref in jobs:
+
+        # NOTE (yiakwy) : only used in this benchmark tool
+        if not getattr(m, "_warmed", False):
+
+            _pcm = read_audio(path, device=args.device)
+
+            # extract features
+            _feats = torch.cat([fe.accept(_pcm), fe.flush()], dim=0)
+
+            # long audio: segment at low-energy points (pos_pe caps at pos_max_len)
+            _max_mel = _max_mel_frames(m, cfg)
+            _spans = _spans_for(_feats, _max_mel, _pcm)
+
+            with torch.inference_mode():
+                for a, b in _spans:
+                    m.encode_ctc_utterance(_feats[a:b][None])
+                if args.use_graphs:
+                    a, b = _spans[0]
+                    ref_logp = m.ctc_logp(m.encode_utterance(_feats[a:b][None]))
+                    got_logp = m.encode_ctc_utterance(_feats[a:b][None])
+                    print(
+                        f"[graphs] replay vs eager max|dlogp|="
+                        f"{(got_logp - ref_logp).abs().max().item():.2e} "
+                        f"({len(_spans)} graph(s) captured)"
+                    )
+            torch.cuda.synchronize()
+            m._warmed = True
+
         start = time.perf_counter()
 
         # read audio
-        pcm = read_audio(path)
+        pcm = read_audio(path, device=args.device)
         if args.seconds:
             pcm = pcm[: int(args.seconds * 16000)]
         audio_dur = len(pcm) / 16000.0
@@ -272,8 +365,15 @@ def main():
 
         start_enc = time.perf_counter()
 
-        # enc = m.encode_utterance(feats[None])
-        enc = torch.cat([m.encode_utterance(feats[a:b][None]) for a, b in spans], dim=1)
+        if args.use_graphs:
+            logp = torch.cat(
+                [m.encode_ctc_utterance(feats[a:b][None])[0] for a, b in spans],
+                dim=0,
+            )
+        else:
+            enc = torch.cat(
+                [m.encode_utterance(feats[a:b][None]) for a, b in spans], dim=1
+            )
 
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -282,9 +382,10 @@ def main():
 
         start_dec = time.perf_counter()
 
-        logp = m.ctc_logp(enc)[0]
+        if not args.use_graphs:
+            logp = m.ctc_logp(enc)[0]
 
-        dec = CtcGreedyDecoder()
+        dec = CtcGreedyDecoder(dedup=args.dedup)
         dec.push_logp(logp)
         txt = text_tok.ids_to_text(dec.tokens).strip().lower()
         elapsed_dec_ctc = time.perf_counter() - start_dec
