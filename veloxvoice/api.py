@@ -104,9 +104,6 @@ class Velox:
         text_tok = TextTokenizer(os.path.join(model_dir, "units.txt"))
 
         cmvn = load_cmvn(model_dir)
-        vocab = _ckct_vocab(model_dir, default=text_tok.vocab_size)
-        if vocab != text_tok.vocab_size:
-            text_tok.units = text_tok.units[:vocab]
 
         from .audio import FrontendConfig
 
@@ -115,7 +112,13 @@ class Velox:
         device = device or platform.device
 
         if platform.module_backend == "torch":
-            from .models.wenet.torch_conformer import WenetConformerASR
+            from .models.wenet.torch_conformer import WenetConformerASR, load_asr_state
+
+            # Load once: the same state supplies CTC vocab discovery and model init.
+            state = load_asr_state(model_dir)
+            vocab = _vocab_from_state(state, default=text_tok.vocab_size)
+            if vocab != text_tok.vocab_size:
+                text_tok.units = text_tok.units[:vocab]
 
             model = WenetConformerASR(
                 model_dir,
@@ -123,7 +126,9 @@ class Velox:
                 required_cache_size=cache_frames,
                 cfg=cfg,
                 vocab=vocab,
+                state=state,
             )
+            del state
             factory = lambda: None  # state lives inside the recognizer session
 
             if native_kernels and hasattr(model, "set_precision"):
@@ -136,6 +141,13 @@ class Velox:
             import mlx.core as mx
 
             from .models.wenet.convert import load_model_from_checkpoint
+            from .models.wenet.torch_conformer import load_asr_state
+
+            vocab = _vocab_from_state(
+                load_asr_state(model_dir), default=text_tok.vocab_size
+            )
+            if vocab != text_tok.vocab_size:
+                text_tok.units = text_tok.units[:vocab]
 
             if cmvn is not None:
                 fcfg.cmvn_mean = mx.array(cmvn[0])
@@ -445,45 +457,12 @@ def _force(backend: str):
     raise ValueError(backend)
 
 
-def _ckct_vocab(model_dir: str, default: int) -> int:
-    """ctc.ctc_lo dim from the same checkpoint path first, final.zip fallback."""
-
-    try:
-        from .models.wenet.torch_conformer import load_avg_pt
-
-        sd = load_avg_pt(model_dir)
-        return int(sd["ctc.ctc_lo.weight"].shape[0])
-    except Exception:
-        try:
-            from .models.wenet.ts_archive import read_ts_archive_tensor_map
-
-            sd = read_ts_archive_tensor_map(os.path.join(model_dir, "final.zip"))
-            return int(sd["model.ctc.ctc_lo.weight"].shape[0])
-        except Exception:
-            return default
-
-
-def _cmvn_from_checkpoint(model_dir):
-    import numpy as np
-
-    try:
-        from .models.wenet.torch_conformer import load_avg_pt
-
-        sd = load_avg_pt(model_dir)
-        mean = sd["encoder.global_cmvn.mean"].numpy().astype(np.float32)
-        istd = sd["encoder.global_cmvn.istd"].numpy().astype(np.float32)
-        return (mean, istd)
-    except Exception:
-        pass
-    try:
-        from .models.wenet.ts_archive import read_ts_archive_tensor_map
-
-        sd = read_ts_archive_tensor_map(os.path.join(model_dir, "final.zip"))
-        mean = sd["model.encoder.global_cmvn.mean"].numpy().astype(np.float32)
-        istd = sd["model.encoder.global_cmvn.istd"].numpy().astype(np.float32)
-        return (mean, istd)
-    except Exception:
-        return None
+def _vocab_from_state(state: dict, default: int) -> int:
+    """Read CTC output size from an already-loaded WeNet checkpoint."""
+    weight = state.get("ctc.ctc_lo.weight")
+    if weight is None:
+        return default
+    return int(weight.shape[0])
 
 
 def _resample_pcm16k(pcm, sample_rate: int):

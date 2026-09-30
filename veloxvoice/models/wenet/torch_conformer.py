@@ -20,6 +20,7 @@ WenetConformerASR
 
 from __future__ import annotations
 
+import glob
 import math
 import os
 
@@ -29,6 +30,156 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import WeNetConfig, load_config
+
+
+def _checkpoint_path(model_dir: str) -> str | None:
+    """Return the preferred native WeNet checkpoint, if one exists."""
+    for pattern in ("avg_*.pt", "final.pt", "*.pt"):
+        candidates = sorted(glob.glob(os.path.join(model_dir, pattern)))
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def _normalize_legacy_state(raw: dict) -> dict:
+    """Normalize WeNet/TorchScript keys for WenetConformerASR."""
+    state: dict = {}
+    for raw_key, value in raw.items():
+        key = raw_key[len("model.") :] if raw_key.startswith("model.") else raw_key
+        if (
+            "num_batches_tracked" in key
+            or key.startswith("decoder.")
+            or ".pos_encoding.pe" in key
+        ):
+            continue
+        if key.startswith("encoder.embed.out_lin."):
+            key = key.replace("encoder.embed.out_lin.", "encoder.embed.out.0.", 1)
+        elif key.startswith("encoder.embed.linear."):
+            key = key.replace("encoder.embed.linear.", "encoder.embed.out.0.", 1)
+        if key.endswith("conv_module.norm_scale"):
+            key = key[: -len("norm_scale")] + "norm.weight"
+        elif key.endswith("conv_module.norm_shift"):
+            key = key[: -len("norm_shift")] + "norm.bias"
+        state[key] = value
+    return state
+
+
+def _state_from_ts_archive(model_dir: str) -> dict:
+    """Normalize a TorchScript bundle into WenetConformerASR checkpoint keys."""
+    from .ts_archive import read_ts_archive_tensor_map
+
+    return _normalize_legacy_state(
+        read_ts_archive_tensor_map(os.path.join(model_dir, "final.zip"))
+    )
+
+
+def load_asr_state(model_dir: str) -> dict:
+    """Load the checkpoint once for both vocabulary discovery and model init.
+
+    Native ``*.pt`` checkpoints are preferred.  TorchScript ``final.zip``
+    bundles are supported through the robust archive reader for hosts where
+    ``torch.jit.load`` cannot deserialize quantized modules.
+    """
+    pt_path = _checkpoint_path(model_dir)
+    if pt_path is not None:
+        state = torch.load(pt_path, map_location="cpu", weights_only=False)
+        if not all(
+            key in state
+            for key in (
+                "encoder.embed.pos_enc.pe",
+                "encoder.global_cmvn.mean",
+                "encoder.global_cmvn.istd",
+                "ctc.ctc_lo.weight",
+            )
+        ):
+            state = _normalize_legacy_state(state)
+        return state
+
+    zip_path = os.path.join(model_dir, "final.zip")
+    if os.path.exists(zip_path):
+        return _state_from_ts_archive(model_dir)
+
+    raise FileNotFoundError(
+        f"no ASR checkpoint found in {model_dir!r}; expected avg_*.pt, final.pt, "
+        "*.pt, or final.zip"
+    )
+
+
+def load_avg_pt(model_dir: str) -> dict:
+    """Backward-compatible alias for the unified ASR checkpoint loader."""
+    return load_asr_state(model_dir)
+
+
+def torch_state_dict(states: dict) -> dict:
+    import re
+
+    out = {}
+    blocks = 0
+    for k0, v in states.items():
+        k = k0[len("model.") :] if k0.startswith("model.") else k0
+        if (
+            "num_batches_tracked" in k
+            or k.startswith("decoder.")
+            or k.startswith("global_cmvn.")
+            or ".pos_encoding.pe" in k
+        ):
+            continue
+
+        m = re.fullmatch(r"encoder\.embed\.conv\.([024])\.(weight|bias)", k)
+        if m:
+            idx = {"0": "conv1", "2": "conv2", "4": "conv3"}[m.group(1)]
+            out[f"encoder.embed.{idx}.{m.group(2)}"] = v
+            continue
+        m = re.fullmatch(r"encoder\.embed\.(?:linear|out\.0)\.(weight|bias)", k)
+        if m:
+            out[f"encoder.embed.out_lin.{m.group(1)}"] = v
+            continue
+        m = re.fullmatch(r"encoder\.after_norm\.(weight|bias)", k)
+        if m:
+            out[f"encoder.after_norm_{'w' if m.group(1) == 'weight' else 'b'}"] = v
+            continue
+        m = re.fullmatch(r"ctc\.ctc_lo\.(weight|bias)", k)
+        if m:
+            out[f"ctc_lo.{m.group(1)}"] = v
+            continue
+
+        m = re.fullmatch(r"encoder\.encoders\.(\d+)\.(.*)", k)
+        if not m or ("conv_module.norm." in k):
+            continue
+        blocks = max(blocks, int(m.group(1)) + 1)
+        rest = m.group(2)
+        base = f"encoder.encoders.{m.group(1)}"
+        for lname in (
+            "norm_ff",
+            "norm_ff_macaron",
+            "norm_mha",
+            "norm_conv",
+            "norm_final",
+        ):
+            if rest == f"{lname}.weight":
+                out[f"{base}.{lname}_w"] = v
+                break
+            if rest == f"{lname}.bias":
+                out[f"{base}.{lname}_b"] = v
+                break
+        else:
+            if rest == "conv_module.depthwise_conv.bias":
+                out[f"{base}.{rest}"] = v
+            elif rest == "conv_module.depthwise_conv.weight":
+                out[f"{base}.{rest}"] = v
+            elif rest in (
+                "conv_module.pointwise_conv1.weight",
+                "conv_module.pointwise_conv2.weight",
+            ):
+                out[f"{base}.{rest}"] = v.squeeze(-1)
+            elif rest == "self_attn.linear_pos.weight":
+                out[f"{base}.self_attn.linear_pos_w"] = v
+            elif rest == "self_attn.linear_pos.bias":
+                pass
+            elif rest.startswith("concat_linear.") or rest.startswith("dropout."):
+                continue
+            else:
+                out[f"{base}.{rest}"] = v
 
 
 class DenseLinear(nn.Linear):
@@ -613,11 +764,7 @@ class WenetConformerASR:
         # NOTE (yiakwy) : main pt file of ASR model.  The API lane may pass a
         # preloaded state dict to avoid a second large-checkpoint read.
         if state is None:
-            state = torch.load(
-                os.path.join(self.model_dir, "final.pt"),
-                map_location="cpu",
-                weights_only=False,
-            )
+            state = load_asr_state(self.model_dir)
 
         self.encoder = WenetConformerEncoder(self.cfg, state).to(device).eval()
 
@@ -630,7 +777,7 @@ class WenetConformerASR:
         )
 
     def load_state_dict(self, sd, strict: bool = False):
-        from .torch_conformer_ref import torch_state_dict as _normalize
+        _normalize = torch_state_dict
 
         normalized = _normalize(sd)
         self.encoder.load_state_dict(normalized, strict=strict)
@@ -852,16 +999,3 @@ class WenetConformerASR:
                 return self.ctc_logp(self.encode_utterance(feats))
         self._graphs[key] = (static_in, graph, static_out)
         return static_out.clone()
-
-
-def load_avg_pt(model_dir: str) -> dict:
-    # Keep checkpoint helpers available from this public native-module module.
-    from .torch_conformer_ref import load_avg_pt as _load_avg_pt
-
-    return _load_avg_pt(model_dir)
-
-
-def torch_state_dict(sd: dict) -> dict:
-    from .torch_conformer_ref import torch_state_dict as _torch_state_dict
-
-    return _torch_state_dict(sd)
