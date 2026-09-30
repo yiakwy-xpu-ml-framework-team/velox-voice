@@ -5,7 +5,7 @@
     <img alt="Velox Voice" src="assets/veloxvoice.svg" width="50%">
   </p>
 
-  <h3>🎙️ Velox Voice :  Frontier Voice Cross Platforms (Hopper / DGX Spark / MacStudio) Inference Engine with JIT Kernels</h3>
+  <h3>🎙️ Velox Voice :  Frontier Cross Platforms (Hopper / DGX Spark / MacStudio) Paged Voice Inference Engine with JIT Kernels</h3>
   <a href="#cite-us">📝 Papers</a> | <a href="#QuickStart">🚀 Quick Start</a> | <a href="#support-dits">🎯 Supported Velox Voice JIT Kernels</a> | <a href="#dev-guide">📚 Dev Guide </a> | <a href="https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/discussions">📈  Discussion </a> | <a href="#Highlight">📝 Highlight </a></strong>
   <p></p>
 
@@ -23,6 +23,12 @@ This repository is porting our "Flash Float JIT Kernels" into audio tasks. Besid
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/fd26e9dc-9830-4d6a-a243-0d17ae425254" width="60%"> </video>
+</div>
+
+**Live (WebRTC) Transcribing instantly**
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/31c056a7-1d24-49e4-bf59-a439004f4b20" width="60%"> </video>
 </div>
 
 Prior VeloxVoice, transcribing long audio with wenet alike model (Conformerencoder + CTC) suffers from extremely computation imbalance.
@@ -304,3 +310,15 @@ oracle (perfect) speaker attribution recovers most of the gap on the meeting set
 
 TF32 `mma.sync` **truncates** (RZ) unconverted fp32 operands, which may be attributed to
 the mis-recognition (see tests/kernels/test_power_mel_log.py).
+
+## Citation
+
+If you use this codebase, or otherwise find our work valuable, please cite VeloxVoice:
+
+```bibtex
+@misc{VeloxVoice,
+  title   = {Velox Voice : Frontier Cross Platforms Paged Voice Inference Engine with JIT Kernels},
+  author  = {LEI WANG, Bei Liu, Yi Peng, Yuan Ruibing, Gu Hao, Sirui Han, Qifeng Chen, Wei Xue, Yike Guo},
+  year    = {2026},
+  url     = {https://github.com/yiakwy-xpu-ml-framework-team/velox-voice}
+}
