@@ -212,6 +212,10 @@ def _transcription_response(
 
     payload = {"text": result.text}
 
+    if result.audio_seconds > 0:
+        payload["audio_seconds"] = result.audio_seconds
+        payload["elapsed_seconds"] = result.elapsed_seconds
+        payload["rtf"] = result.rtf
     if usage is not None:
         payload["usage"] = usage
     return JSONResponse(payload)

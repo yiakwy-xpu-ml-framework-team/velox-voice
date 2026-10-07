@@ -75,7 +75,7 @@ No/Less CPU : Every stage of the streaming chunk loop stays on the accelerator a
 
 Follow the gold standard GPU fbank from Kaldi, we implemented GPU JIT kernels such as `power_mel_log`, `CMVN`, `pwlin` (conv1), `fused layer norm` and so on so forth on DGX spark.
 
-Before sending audio chunk to Went Conformer on GPU, we unified continous (fbank) Tokenizer with the discret one with compaction via codebook for AR models.
+Before sending audio chunk to Went Conformer on GPU, we unified continous (fbank) Tokenizer with the discret one through compaction via codebook for AR models.
 
 CTC greedy decode also plays an important role in achieving peak performance. Traditional implementation freqeuntly transfer tokens in and out from GPU to remove duplicates, and we maximize the duration of the data on GPU and use piecewise graph capture to acclerate computation.
 
@@ -318,7 +318,7 @@ If you use this codebase, or otherwise find our work valuable, please cite Velox
 ```bibtex
 @misc{VeloxVoice,
   title   = {Velox Voice : Frontier Cross Platforms Paged Voice Inference Engine with JIT Kernels},
-  author  = {LEI WANG, Bei Liu, Yi Peng, Yuan Ruibing, Gu Hao, Sirui Han, Qifeng Chen, Wei Xue, Yike Guo},
+  author  = {LEI WANG, Bei Liu, Yi Peng, Ruibing Yuan , Hao Gu, Sirui Han, Qifeng Chen, Wei Xue, Yike Guo},
   year    = {2026},
   url     = {https://github.com/yiakwy-xpu-ml-framework-team/velox-voice}
 }
