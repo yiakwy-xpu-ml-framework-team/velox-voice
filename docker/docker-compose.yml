@@ -1,0 +1,68 @@
+# VeloxVoice ASR — docker compose (one-command build & serve).
+#
+#   bash docker/run.sh                 # GPU defaults to 0
+#   VELOX_GPU=5 bash docker/run.sh     # H800 test box currently uses GPU 5
+#
+# or directly:
+#   VELOX_GPU=5 docker compose -f docker/docker-compose.yml up --build -d
+#
+# GPU model: the container sees ALL host GPUs; the working GPU is chosen with
+# VELOX_GPU (physical PCI index -> CUDA_VISIBLE_DEVICES), the same convention as
+# scripts/run_server_background.sh.
+name: veloxvoice
+
+services:
+  veloxvoice:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-nvidia/cuda:13.0.0-devel-ubuntu24.04}
+        TORCH_INDEX: ${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}
+    image: veloxvoice-asr:latest
+    container_name: veloxvoice-asr
+
+    environment:
+      # Default working GPU is 0; set VELOX_GPU=5 for the current test box.
+      VELOX_GPU: "${VELOX_GPU:-0}"
+      VELOX_MODEL_DIR: "/models/asr_model"
+      VELOX_HOST: "0.0.0.0"
+      VELOX_PORT: "${VELOX_PORT:-8000}"
+      VELOXVOICE_KERNEL_CACHE: "/var/cache/veloxvoice"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      CUDA_DEVICE_ORDER: "PCI_BUS_ID"
+
+    ports:
+      - "${VELOX_PORT:-8000}:${VELOX_PORT:-8000}"
+
+    volumes:
+      # ASR bundle — mounted read-only, never baked into the image.
+      # Override the host path with MODEL_HOST_DIR=/abs/path/to/asr_model.
+      - "${MODEL_HOST_DIR:-../data/models/asr_model}:/models/asr_model:ro"
+      # Server logs + uploaded/decoded audio (user_data).
+      - "../logs:/app/logs"
+      # Persist the nvcc/TVM-FFI JIT build cache across restarts.
+      - veloxvoice-kernel-cache:/var/cache/veloxvoice
+
+    shm_size: "8gb"
+
+    # Expose every GPU so VELOX_GPU can pick a physical index.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${VELOX_PORT:-8000}/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 10
+
+    restart: unless-stopped
+
+volumes:
+  veloxvoice-kernel-cache:
