@@ -1,0 +1,38 @@
+# Build context exclusions for the VeloxVoice ASR image.
+
+# --- VCS / tooling ---
+.git
+.gitignore*
+.pre-commit-config.yaml
+.opencode
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+
+# --- out-of-context symlinks (model + speaker fixtures) ---
+# `data` -> VeloxVoice-dev/data (11 GB model) and `speaker_test` live outside the
+# build context; the model is bind-mounted at runtime instead.
+data
+speaker_test
+
+# --- runtime state / large or generated artifacts ---
+logs
+*.log
+*.pid
+test_data
+assets
+benchmark/results
+benchmark/accuracy
+benchmark/visualize_gemm_pipelining
+VeloxVoice
+tools/1_hrs.mp3
+*.wav
+*.mp3
+*.flac
+*.npy
+*.tar.gz
+
+# --- secrets ---
+.env
+docker/.env
