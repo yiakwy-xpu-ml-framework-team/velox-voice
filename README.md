@@ -17,6 +17,8 @@ This repository is porting our "Flash Float JIT Kernels" into audio tasks. Besid
 
 - Sep 10 2026, [🔥 Transcribing 1-hour candonese audio within few seconds on DGX Spark , RTF 0.001 (x1000 acceleration) 🚀 with almost good Condonese Recoginition 🎯!](#Transcribing-1-hrs-audio-in-seconds-on-dgx-spark)
 
+- Oct 16 2026, [📣 update rescore algorithm, prefix beam serach is 3999x faster 💥](https://github.com/yiakwy-xpu-ml-framework-team/velox-voice/pull/13), with 13.2% Corpus CER for AISHELL-4 and updated [accuracy coverage](https://github.com/yiakwy-xpu-ml-framework-team/velox-voice/blob/main/benchmark/accuracy/accuracy.md)
+
 <h2 id="Transcribing-1-hrs-audio-in-seconds-on-dgx-spark">🔥 Transcribing 1-hour audio in seconds on DGX Spark</h2>
 
 **Transcribing 1-hour audio into few seconds**
