@@ -320,7 +320,7 @@ def bench_full(model_dir: str, beam=5, iters=20):
     print("  is an approximation; the attention decoder rescoring compensates.")
 
     print("  AISHELL-4 corpus CER is measured by benchmark/accuracy/")
-    print("  bench_accuracy_local.sh: greedy 13.17%, rescore 13.02%,")
+    print("  bench_accuracy_local.sh: greedy 13.17%, rescore 13.02%,:")
     print("  see benchmark/accuracy/accuracy.md.")
 
 def main():

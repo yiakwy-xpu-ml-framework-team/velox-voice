@@ -1,25 +1,4 @@
-"""Native (eager) WeNet BiTransformerDecoder for attention rescoring.
-
-Replaces the TorchScript bundle decoder: the weights live in the runtime
-checkpoint (``final.pt`` carries 168 ``decoder.*`` tensors — left/right
-BiTransformerDecoder — which the encoder/CTC loader used to drop).
-
-Architecture mirrored 1:1 from the TorchScript graph (verified by
-`tests/kernels/... parity test` and numerically against the bundle decoder):
-
-  BiTransformerDecoder.forward(memory, memory_mask, ys_in_pad, ys_in_lens,
-                               r_ys_in_pad, reverse_weight=0)
-    -> left only when reverse_weight <= 0 (the rescorer passes 0)
-  BaseTransformerDecoder.forward:
-    tgt_mask   = ~make_pad_mask(ys_in_lens, maxlen) & subsequent_mask(maxlen)
-    x          = Embedding(ys_in_pad) * xscale + pe[:, 0:maxlen]   (dropout=eval)
-    x          = for each layer: pre-norm self-attn -> pre-norm src-attn
-                 -> pre-norm ReLU FFN (all with residual)
-    x          = after_norm(x) -> output_layer
-  MultiheadAttention (h=8, d_k=64, use_sdpa=False):
-    q/k/v = Linear -> view(B, -1, h, d_k).transpose(-3, -2)
-    scores = q @ k^T / sqrt(d_k); mask==0 -> -inf; softmax(float32)
-"""
+"""Native BiTransformerDecoder implementation of WeNet style Conformer encoder + attention rescoring."""
 
 from __future__ import annotations
 
@@ -45,8 +24,7 @@ def subsequent_mask(size: int, device="cpu") -> torch.Tensor:
 
 
 class MultiheadAttention(nn.Module):
-    """WeNet MHA: separate q/k/v/out projections, bool-mask (-inf fill),
-    float32 softmax, no SDPA (matches the bundle graph)."""
+    """Rescore attention module, no SPDA for audio task"""
 
     def __init__(self, d_model: int, num_heads: int, dropout_rate: float = 0.0):
         super().__init__()
@@ -141,12 +119,16 @@ class DecoderLayer(nn.Module):
                  self_attn_dropout=0.0, src_attn_dropout=0.0):
         super().__init__()
         self.normalize_before = True
+        
         self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
         self.self_attn = MultiheadAttention(d_model, num_heads, self_attn_dropout)
+
         self.norm2 = nn.LayerNorm(d_model, eps=1e-5)
         self.src_attn = MultiheadAttention(d_model, num_heads, src_attn_dropout)
+
         self.norm3 = nn.LayerNorm(d_model, eps=1e-5)
         self.feed_forward = FeedForward(d_model, units, dropout_rate)
+
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, tgt, tgt_mask, memory, memory_mask, cache=None):
