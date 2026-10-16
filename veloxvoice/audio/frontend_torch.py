@@ -6,9 +6,11 @@ pre-emphasis, framing (unfold), povey window, rFFT power, mel matmul, log, CMVN.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 from .features import log_floor, mel_filterbank, povey_window
 
@@ -56,6 +58,9 @@ class TorchGpuFrontend:
         self._buf = torch.zeros(0, device=device)  # pre-emphasized samples
         self._tail = torch.zeros(1, device=device)
 
+        # NOTE (yiakwy) : set to 0 to restore signal-level preemphasis without padding
+        self.kaldi = os.environ.get("VELOXVOICE_FRONTEND_KALDI", "1") == "1"
+
         # Pre-quantize mel for mxfp4 path
         self._mel_codes = None
         self._mel_scales = None
@@ -91,7 +96,13 @@ class TorchGpuFrontend:
     def _frames_to_fbank(self, frames):
         """frames: [T, fl] device."""
         backend = self.backend
-        win = frames * self.window
+        if self.kaldi:
+            x = frames - frames.mean(dim=-1, keepdim=True)
+            padded = F.pad(x.unsqueeze(0), (1, 0), mode="replicate").squeeze(0)
+            x = x - self.cfg.preemph * padded[:, :-1]
+            win = x * self.window
+        else:
+            win = frames * self.window
         spec = backend.fft.rfft(win, n=self.n_fft)  # [T, F] complex
         if self.device.startswith("cuda"):
             precision = self.cfg.precision
@@ -109,6 +120,9 @@ class TorchGpuFrontend:
                     self._F_padded,
                     self._M_padded,
                 )[:, : self.cfg.num_mel_bins]
+            elif precision == "fp32":
+                # skip the JIT power_mel_log kernel
+                pass
             else:
                 from veloxvoice.kernels.ops import power_mel_log
 
@@ -129,8 +143,11 @@ class TorchGpuFrontend:
         if not isinstance(pcm, backend.Tensor):
             pcm = backend.as_tensor(pcm, dtype=backend.float32)
         pcm = pcm.to(self.device) * 32768.0  # kaldi/WeNet int16 scaling
-        y = self._preemph(pcm)
-        self._buf = backend.cat([self._buf, y])
+        if self.kaldi:
+            self._buf = backend.cat([self._buf, pcm])
+        else:
+            y = self._preemph(pcm)
+            self._buf = backend.cat([self._buf, y])
 
         n = self._book.n_complete(int(self._buf.shape[0]))
         if n == 0:
@@ -143,6 +160,12 @@ class TorchGpuFrontend:
     def flush(self) -> "object":
         """Flush trailing partial frame (zero-padded to frame_length)."""
         backend = self.backend
+        if self.kaldi:
+            # NOTE (yiakwy) : the incomplete trailing frame is dropped (snip_edges).
+            self._buf = self._buf.new_zeros(0)
+            return self._buf.new_zeros((0, self.cfg.num_mel_bins))
+        else:
+            pass
         r = int(self._buf.shape[0])
         if r < max(1, self.fs):
             return self._buf.new_zeros((0, self.cfg.num_mel_bins))
@@ -151,3 +174,40 @@ class TorchGpuFrontend:
         frames = padded[: (0) * self.fs + self.fl][None, :]  # single frame
         self._buf = self._buf.new_zeros(0)
         return self._frames_to_fbank(frames)
+
+
+class KaldiGpuFrontend:
+    """``torchaudio.compliance.kaldi.fbank`` frontend."""
+
+    def __init__(self, cfg: FrontendConfig, device: str = "cuda:0"):
+        self.cfg = cfg
+        self.device = device
+        self._buf: list[torch.Tensor] = []
+
+    def accept(self, pcm) -> torch.Tensor:
+        if not isinstance(pcm, torch.Tensor):
+            pcm = torch.as_tensor(pcm, dtype=torch.float32)
+        self._buf.append(pcm.reshape(-1).to(dtype=torch.float32, device="cpu"))
+        return torch.zeros((0, self.cfg.num_mel_bins), device=self.device)
+
+    def flush(self) -> torch.Tensor:
+        if not self._buf:
+            return torch.zeros((0, self.cfg.num_mel_bins), device=self.device)
+        else:
+            pass
+        import torchaudio.compliance.kaldi as kaldi
+
+        wav = torch.cat(self._buf).to(self.device)
+        self._buf = []
+        if wav.numel() < int(0.025 * self.cfg.sample_rate):
+            return torch.zeros((0, self.cfg.num_mel_bins), device=self.device)
+        else:
+            pass
+        return kaldi.fbank(
+            (wav * 32768.0).unsqueeze(0),
+            num_mel_bins=self.cfg.num_mel_bins,
+            frame_length=25,
+            frame_shift=10,
+            energy_floor=0.0,
+            sample_frequency=self.cfg.sample_rate,
+        )

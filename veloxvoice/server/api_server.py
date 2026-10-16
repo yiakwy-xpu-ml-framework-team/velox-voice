@@ -236,8 +236,10 @@ class _AudioStreamSession:
         sample_rate: int = SAMPLE_RATE,
         audio_path: Path | None = None,
         first_pool_seconds: float = 1.0,
+        decode: str | None = None,
     ) -> None:
         self.vx = vx
+        self.decode = decode
 
         self.pool_samples = max(1600, int(pool_seconds * sample_rate))
 
@@ -417,7 +419,7 @@ class _AudioStreamSession:
 
                 pcm = np.frombuffer(raw, dtype=np.float32)
 
-                result = await asyncio.to_thread(self.vx.transcribe_pcm, pcm)
+                result = await asyncio.to_thread(self.vx.transcribe_pcm, pcm, decode=self.decode)
 
                 result.spans = _offset_spans(result.spans, frame_offset)
                 results.append(result)
@@ -436,7 +438,7 @@ class _AudioStreamSession:
                 # Keep the final pool graph-shape stable with the warm pool.
                 pcm = np.pad(pcm, (0, target_samples - pcm.size))
 
-            result = await asyncio.to_thread(self.vx.transcribe_pcm, pcm)
+            result = await asyncio.to_thread(self.vx.transcribe_pcm, pcm, decode=self.decode)
 
             result.audio_seconds = actual_samples / self.sample_rate
             result.spans = _offset_spans(result.spans, frame_offset)
@@ -561,7 +563,9 @@ def create_app(
         repetition_penalty: float | None = Form(default=None, gt=0.0),
         max_new_tokens: int | None = Form(default=None, ge=1),
         stream: bool = Form(default=False),
+        rescore: bool | None = Form(default=None),
     ) -> Response:
+        decode = None if rescore is None else ("att_rescore" if rescore else "greedy")
         response_format = response_format.strip().lower()
         if stream:
             if response_format not in STREAMING_RESPONSE_FORMATS:
@@ -624,7 +628,7 @@ def create_app(
                     buffer = np.concatenate((buffer, pcm))
                     while buffer.size >= target:
                         result = await asyncio.to_thread(
-                            vx.transcribe_pcm, buffer[:target]
+                            vx.transcribe_pcm, buffer[:target], decode=decode
                         )
                         results.append(result)
                         completed_seconds += result.audio_seconds
@@ -648,6 +652,7 @@ def create_app(
                         result = await asyncio.to_thread(
                             vx.transcribe_pcm,
                             np.pad(buffer, (0, target - buffer.size)),
+                            decode=decode,
                         )
                         result.audio_seconds = buffer.size / SAMPLE_RATE
                         results.append(result)
@@ -705,7 +710,7 @@ def create_app(
             )
 
         pcm = await asyncio.to_thread(_decode_audio_bytes, data)
-        result = await asyncio.to_thread(vx.transcribe_pcm, pcm)
+        result = await asyncio.to_thread(vx.transcribe_pcm, pcm, decode=decode)
         result.text = result.text.strip()
         await asyncio.to_thread(_write_result_metadata, audio_path, result)
         return _transcription_response(result, response_format, language)
@@ -743,6 +748,7 @@ def create_app(
                             str(obj.get("format", input_format)),
                             int(obj.get("sample_rate", SAMPLE_RATE)),
                             audio_path=audio_path,
+                            decode=("att_rescore" if bool(obj.get("rescore")) else None),
                         )
                         await session.start()
 
@@ -888,6 +894,9 @@ _CLIENT_HTML = r"""<!doctype html>
         <option value="20">20s pool</option>
         <option value="30">30s pool</option>
       </select>
+      <label id="rescoreLabel" title="attention rescoring (slower, slightly more accurate)">
+        <input type="checkbox" id="rescore" /> rescore
+      </label>
       <button id="uploadBtn" disabled>Upload</button>
       <button id="transcribeBtn" disabled>Transcribe (after uploading)</button>
       <button id="webrtcBtn" class="live" disabled>Transcribing (WebRTC)</button>
@@ -909,6 +918,7 @@ _CLIENT_HTML = r"""<!doctype html>
 const fileInput = document.querySelector('#file');
 const drop = document.querySelector('#drop');
 const poolSel = document.querySelector('#pool');
+const rescoreChk = document.querySelector('#rescore');
 const uploadBtn = document.querySelector('#uploadBtn');
 const transcribeBtn = document.querySelector('#transcribeBtn');
 const webrtcBtn = document.querySelector('#webrtcBtn');
@@ -1125,6 +1135,7 @@ transcribeBtn.onclick = async () => {
   form.append('audio_id', uploadedId);
   form.append('response_format', 'json');
   form.append('stream', 'true');
+  form.append('rescore', rescoreChk.checked ? 'true' : 'false');
   try {
     const response = await fetch('/v1/audio/transcriptions', { method: 'POST', body: form });
     if (!response.ok) {
@@ -1191,6 +1202,7 @@ webrtcBtn.onclick = async () => {
           pool_seconds: Number(poolSel.value),
           format: inputFormat(selectedFile),
           filename: selectedFile.name,
+          rescore: rescoreChk.checked,
         }));
         resolve();
       };
@@ -1281,7 +1293,13 @@ def main() -> None:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--precision", default="bf16", choices=("bf16", "fp32"))
+    ap.add_argument(
+        "--precision",
+        default="bf16",
+        choices=("fp16", "bf16", "fp32"),
+        help="model precision lane; env VELOXVOICE_PRECISION overrides it "
+             "(fp16=fp32 weights+autocast, fp32=high-precision, bf16=default)",
+    )
     ap.add_argument("--pool-seconds", type=float, default=20.0)
     ap.add_argument("--no-graphs", action="store_true")
     args = ap.parse_args()

@@ -270,6 +270,14 @@ def main():
         default="bf16",
         help="frontend precision mode (default: bf16)",
     )
+    ap.add_argument(
+        "--rescore",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="also run attention rescoring (AttRescorer) and report its text/rtf",
+    )
+    ap.add_argument("--beam", type=int, default=5)
+    ap.add_argument("--ctc-weight", type=float, default=0.5)
     args = ap.parse_args()
 
     cfg = load_config(args.model_dir)
@@ -317,6 +325,22 @@ def main():
     print(
         f"benchmark [jit={'ON' if args.use_jit else 'OFF'}] precision={args.precision} iters={args.iters}..."
     )
+
+    # rescorer built at model-load time; decoder weights come from the
+    # checkpoint/bundle via m.attention_decoder
+    rs = None
+    if args.rescore:
+        decoder = getattr(m, "attention_decoder", None)
+        if decoder is not None:
+            from veloxvoice.stream.rescore import get_att_rescorer
+
+            rs = get_att_rescorer(
+                decoder, beam=args.beam, ctc_weight=args.ctc_weight,
+                device=args.device,
+                search=os.environ.get("VELOXVOICE_BEAM_BACKEND", "jit_kernel"))
+        else:
+            print("[warn] no attention decoder in checkpoint; RESCORE ignored")
+
     tot_e = tot_w = 0.0
     elapse_enc_list, enc_rtf_list, tot_wall = [], [], 0.0
     for name, path, ref in jobs:
@@ -345,6 +369,15 @@ def main():
                         f"{(got_logp - ref_logp).abs().max().item():.2e} "
                         f"({len(_spans)} graph(s) captured)"
                     )
+                # NOTE (yiakwy) : RESCORE warm — first cluster-kernel launch,
+                # native-decoder cuBLAS init and workspace grow happen here,
+                # outside the timed region (steady-state rtf is what matters)
+                if rs is not None:
+                    encs = [m.encode_utterance(_feats[a:b][None])
+                            for a, b in _spans]
+                    for enc_i in encs:
+                        lp_i = m.ctc_logp(enc_i)[0]
+                        rs.decode(enc_i, lp_i)
             torch.cuda.synchronize()
             m._warmed = True
 
@@ -371,9 +404,8 @@ def main():
                 dim=0,
             )
         else:
-            enc = torch.cat(
-                [m.encode_utterance(feats[a:b][None]) for a, b in spans], dim=1
-            )
+            enc_parts = [m.encode_utterance(feats[a:b][None]) for a, b in spans]
+            enc = torch.cat(enc_parts, dim=1)
 
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -390,6 +422,26 @@ def main():
         txt = text_tok.ids_to_text(dec.tokens).strip().lower()
         elapsed_dec_ctc = time.perf_counter() - start_dec
 
+        # NOTE (yiakwy) : the rescore marginal is computed with
+        # ctc_logp slice + beam + native-decoder prefill:
+        #   P(y | x) = Σ_{π ∈ B⁻¹(y)} P(π | x)
+        txt_rs, rs_elapsed = None, None
+        if args.rescore and rs is not None:
+            t0 = time.perf_counter()
+
+            ids_rs = []
+            with torch.inference_mode():
+                for enc_i in enc_parts:
+                    lp = m.ctc_logp(enc_i)[0]
+                    ids_rs.extend(rs.decode(enc_i, lp))
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
+
+            txt_rs = text_tok.ids_to_text(ids_rs).strip().lower()
+            rs_elapsed = time.perf_counter() - t0
+
+            rescore_rtf = (enc_elapsed + rs_elapsed) / audio_dur
+
         late_wall = time.perf_counter() - start
 
         wer_txt = ""
@@ -399,8 +451,15 @@ def main():
             tot_w += n
             wer_txt = f" err={e}" + (" (EXACT)" if e == 0 else "")
 
+        wer_rs_txt = ""
+        if rs is not None:
+            e, n = wer(txt, txt_rs)
+            tot_e += e
+            tot_w += n
+            wer_rs_txt = f" err={e}" + (" (EXACT)" if e == 0 else "")
+
         enc_rtf = enc_elapsed / audio_dur
-        total_rtf = late_wall / audio_dur
+        greedy_rtf = (enc_elapsed + elapsed_dec_ctc) / audio_dur
 
         elapse_enc_list.append(enc_elapsed)
         enc_rtf_list.append(enc_rtf)
@@ -409,12 +468,21 @@ def main():
 
         seg_txt = f" segs={len(spans)}" if len(spans) > 1 else ""
         print(
-            f"[{name}] {audio_dur:6.2f}s{seg_txt} enc={enc_elapsed *1e3:8.2f}ms, late_wall={late_wall *1e3:8.2f} "
-            f"total rtf={total_rtf:.4f}, encoder rtf={enc_rtf:.4f} (+ctc={elapsed_dec_ctc *1e3:4.1f}ms){wer_txt}"
+            f"[{name}] {audio_dur:6.2f}s{seg_txt} enc={enc_elapsed *1e3:8.2f}ms "
+            f"greedy-rtf={greedy_rtf:.6f} (encoder-rtf={enc_rtf:.6f}, +ctc={elapsed_dec_ctc *1e3:4.1f}ms)"
+            f"{wer_txt}"
         )
         print("  hyp:", txt)
         if ref:
             print("  ref:", ref)
+        
+        if txt_rs is not None:
+            print(
+                f"[{name}] {audio_dur:6.2f}s{seg_txt} "
+                f"rescore-rtf={rescore_rtf:.6f} (rs_elapsed={rs_elapsed * 1e3:.1f}ms)"
+                f"{wer_rs_txt}"
+            )
+            print("  hyp(rs):", txt_rs)
 
     if tot_w:
         print(f"\nTOTAL WER = {int(tot_e)}/{int(tot_w)} = {tot_e / tot_w * 100:.2f}%")

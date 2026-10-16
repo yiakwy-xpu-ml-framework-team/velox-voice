@@ -11,6 +11,15 @@ def make_frontend(cfg: FrontendConfig, device: str | None = None):
         from .frontend_mlx import MlxGpuFrontend
 
         return MlxGpuFrontend(cfg)
-    from .frontend_torch import TorchGpuFrontend
+        
+    import os
 
-    return TorchGpuFrontend(cfg, device=device or "cuda:0")
+    if os.environ.get("VELOXVOICE_FRONTEND", "kaldi").lower() == "kaldi":
+        # NOTE (yiakwy) : switch to torch KaldiGpuFrontend for better accuracy
+        from .frontend_torch import KaldiGpuFrontend
+
+        return KaldiGpuFrontend(cfg, device=device or "cuda:0")
+    else:
+        from .frontend_torch import TorchGpuFrontend
+
+        return TorchGpuFrontend(cfg, device=device or "cuda:0")
