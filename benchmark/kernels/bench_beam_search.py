@@ -315,9 +315,13 @@ def bench_full(model_dir: str, beam=5, iters=20):
         print(f"{backend:>18s} {ms:>10.2f} {ms / 1000 / dur:>11.6f} {tag:>10s}")
         if ref is None:
             ref = out
+    
     print("  NOTE: jit_kernel uses chunk-parallel beam (C>1) — the CTC N-best")
     print("  is an approximation; the attention decoder rescoring compensates.")
-    print("  AISHELL-4 accuracy is identical for both backends (13.12%).")
+
+    print("  AISHELL-4 corpus CER is measured by benchmark/accuracy/")
+    print("  bench_accuracy_local.sh: greedy 13.17%, rescore 13.02%,")
+    print("  see benchmark/accuracy/accuracy.md.")
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)

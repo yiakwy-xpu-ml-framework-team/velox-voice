@@ -734,12 +734,20 @@ def _beam_mod_legacy():
 
 @functools.cache
 def _beam_mod():
+    from veloxvoice.kernels.helper_cuda import cuda_arch_str
     from veloxvoice.kernels.utils import build_cuda_module
+
+    # Thread-block clusters + DSMEM (map_shared_rank) are sm_90+ base
+    # features — the same source runs on Hopper and DGX Spark (GB10, sm_121,
+    # portable cluster size 8). The cubin arch must match the device though:
+    # '9.0a' on Hopper, '12.1a' on GB10 (Spark), native arch elsewhere.
+    arch = cuda_arch_str()
+    override = {"9.0": "9.0a", "12.1": "12.1a"}.get(arch, arch)
 
     # NOTE (yiakwy) : 252.7x (T=2500) ~ upto 3999x (T>=30k, for 1 hrs audio) faster than tradition prefix_beam_search !
     return build_cuda_module(
         "beam_cluster_ops", ("velox_prefix_beam_search.cu",), ("beam_search",),
-        arch_override="9.0a",
+        arch_override=override,
     )
 
 
