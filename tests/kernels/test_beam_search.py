@@ -52,15 +52,40 @@ def test_kernel_long_score_set(T: int, V: int):
 
 
 def test_attrescorer_gpu_search_matches_host():
-    """AttRescorer._search("jit_kernel"/"jit_kernel_legacy") == "host" N-best."""
+    """AttRescorer._search("jit_kernel") == "host" N-best."""
     torch.manual_seed(0)
     logp = torch.log_softmax(torch.randn(150, 500, device="cuda"), dim=-1)
     rs_host = AttRescorer(None, beam=5, dim=64, device="cuda", search="host")
-    for backend in ("jit_kernel", "jit_kernel_legacy"):
+    # NOTE (yiakwy) : "jit_kernel_legacy" (single-block baseline kernel) is
+    # kept for reference but skipped here — beam_search now dispatches every
+    # chunk_frames to the cluster kernel.
+    for backend in ("jit_kernel",):
         rs_gpu = AttRescorer(None, beam=5, dim=64, device="cuda", search=backend)
         h_gpu, _ = rs_gpu._search(logp)
         h_host, _ = rs_host._search(logp)
         assert h_gpu == h_host
+
+
+@pytest.mark.parametrize("T,V,cf", [(120, 200, 0), (300, 1000, 64),
+                                    (500, 300, 128), (300, 1000, 64)])
+def test_workspace_reuse_matches_fresh(T: int, V: int, cf: int):
+    """BeamWorkspace reuse == fresh allocations, for every chunk_frames
+    (C=1 exact sweep and C>1 chunked); repeated same-shape calls exercise
+    the stale-buffer invariants, and the growing-T case exercises _grow."""
+    from veloxvoice.kernels.ops.cuda_ops import BeamWorkspace
+
+    torch.manual_seed(T + cf)
+    ws = BeamWorkspace("cuda")
+    for rep in range(2):
+        logp = torch.log_softmax(torch.randn(T, V, device="cuda"), dim=-1)
+        fresh = _kernel(logp, 5, chunk_frames=cf)
+        tv, ti = torch.topk(logp, 5, dim=-1)
+        tok, ln, sc = beam_search(ti, tv, beam=5, blank=0, chunk_frames=cf,
+                                  ws=ws)
+        got = [(tuple(tok[i, : int(ln[i])].tolist()), float(sc[i]))
+               for i in range(tok.shape[0])]
+        assert [t for t, _ in fresh] == [t for t, _ in got], \
+            f"ws reuse diverged (T={T}, cf={cf}, rep={rep})"
 
 
 def _attrescorer_gpu_search_matches_host_unused():

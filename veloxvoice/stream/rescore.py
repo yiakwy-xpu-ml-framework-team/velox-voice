@@ -215,7 +215,9 @@ class AttRescorer:
         # backends: "jit_kernel"        -> multi-block cluster kernel (default,
         #                                  chunk_frames>0, block 0 stitches the
         #                                  N-best; C=1 degenerates to exact)
-        #          "jit_kernel_legacy" -> single-block baseline kernel
+        #          "jit_kernel_legacy" -> accepted for compat; beam_search now
+        #                                  dispatches every chunk_frames to the
+        #                                  same cluster kernel (C=1 here)
         #          "host"              -> python device-top-k beam reference
         # Deprecated aliases ("gpu", "kernel", "jit_kernel_mp", "tensor") are
         # gone on purpose.

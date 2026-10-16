@@ -10,7 +10,9 @@ def __getattr__(name):
 
         return TorchWenEtModel
     if name == "WeNetASRModelMLX":
-        from .mlx_model import WeNetASRModelMLX
+        # TODO (yiakwy) : adding MLX modules
+        # from .mlx_model import WeNetASRModelMLX
 
-        return WeNetASRModelMLX
+        # return WeNetASRModelMLX
+        pass
     raise AttributeError(name)
