@@ -177,6 +177,15 @@ def transcribe(
 
     dec = CtcGreedyDecoder()
 
+    # RESCORE=1 -> decode each span via attention rescoring (not greedy)
+    rs = None
+    if os.environ.get("RESCORE", "0") == "1":
+        from veloxvoice.stream.rescore import get_att_rescorer
+
+        decoder = getattr(m, "attention_decoder", None)
+        if decoder is not None:
+            rs = get_att_rescorer(decoder, device=device, dim=cfg.output_size)
+
     enc_ctc_elapse = worker_elapse = 0.0
 
     max_calls = int(os.environ.get("WENET_INPROC_MAX_CALLS", str(max_calls)))
@@ -184,7 +193,15 @@ def transcribe(
     if len(spans) <= max_calls:
         t2 = time.perf_counter()
 
-        if (
+        if rs is not None:
+            # NOTE (yiakwy) : RESCORE=1 use per-span attention rescoring
+            encs = [m.encode_utterance(feats[a:b][None]) for a, b in spans]
+            torch.cuda.synchronize()
+            ids = []
+            for enc in encs:
+                lp = m.ctc_logp(enc)[0]
+                ids.extend(rs.decode(enc, lp))
+        elif (
             len(spans) >= 2
             and feats.is_cuda
             and os.environ.get("WENET_INPROC_SERIAL", "0") != "1"
@@ -407,6 +424,15 @@ def _worker_main(args):
     fe = TorchGpuFrontend(cfg_local, args.device)
     dec = CtcGreedyDecoder()
 
+    # RESCORE=1 -> decode via attention rescoring
+    rs = None
+    if os.environ.get("RESCORE", "0") == "1":
+        from veloxvoice.stream.rescore import get_att_rescorer
+
+        decoder = getattr(m, "attention_decoder", None)
+        if decoder is not None:
+            rs = get_att_rescorer(decoder, device=args.device, dim=cfg.output_size)
+
     results = []
     for a, b in job["spans"]:
         s = int(a) * fe.fs
@@ -423,12 +449,16 @@ def _worker_main(args):
         )
 
         dec_start = time.perf_counter()
-        dec.push_logp(logp)
+        if rs is not None:
+            ids = rs.decode(enc, logp)
+        else:
+            dec.push_logp(logp)
+            ids = dec.tokens
         print(
             f"[worker#{job_id}] decode span{[a,b]} {(time.perf_counter() - dec_start)*1e3:.0f}ms"
         )
 
-        results.append({"span": [a, b], "ids": [int(t) for t in dec.tokens]})
+        results.append({"span": [a, b], "ids": [int(t) for t in ids]})
 
     dump_disk = time.perf_counter()
 

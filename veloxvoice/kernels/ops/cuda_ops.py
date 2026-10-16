@@ -10,6 +10,7 @@ import functools
 
 import tvm_ffi
 
+
 # TODO (yiakwy) : add compilation guard
 
 
@@ -720,3 +721,183 @@ def _dequantize_to_bf16(packed, scale_u8):
     w = torch.where(sign, -mag, mag)
     s = (2.0 ** (scale_u8.to(torch.int16).to(torch.float32) - 127)).unsqueeze(1)
     return (w * s).to(torch.bfloat16)
+
+
+@functools.cache
+def _beam_mod_legacy():
+    from veloxvoice.kernels.utils import build_cuda_module
+
+    return build_cuda_module(
+        "beam_ops_legacy", ("velox_prefix_beam_search_legacy.cu",), ("beam_search",)
+    )
+
+
+@functools.cache
+def _beam_mod():
+    from veloxvoice.kernels.utils import build_cuda_module
+
+    # NOTE (yiakwy) : 252.7x (T=2500) ~ upto 3999x (T>=30k, for 1 hrs audio) faster than tradition prefix_beam_search !
+    return build_cuda_module(
+        "beam_cluster_ops", ("velox_prefix_beam_search.cu",), ("beam_search",),
+        arch_override="9.0a",
+    )
+
+
+class BeamWorkspace:
+    """Preallocated, grow-on-demand GPU scratch for beam_search.
+
+    Pass ``ws=BeamWorkspace(device)`` to reuse buffers across calls. 
+    
+    Reuse is strictly correct because of these invariants:
+      * the kernels only ever write valid token ids (<V) or 0 into ``tokens``,
+        so stale values beyond the current L are safe to gather (they are
+        masked out of the score by gpos, and valid embedding indices);
+      * hist rows [0, T) are fully rewritten each call (passed as a leading
+        dim-slice view, contiguous);
+      * lens/scores are fully overwritten each call;
+      * ``done`` is re-zeroed by the wrapper on every call;
+      * c_tok is a flat 1-D scratch: within one call the kernel writes and
+        reads the same [0, l_c) regions (l_c <= ln <= cf).
+    """
+
+    def __init__(self, device):
+        import torch
+
+        self.device = torch.device(device) if isinstance(device, str) else device
+        self._hist = self._histapp = None
+        self._tokens = self._lens = self._scores = None
+        self._ctok = self._done = None
+        self._T_cap = self._B_cap = self._ctok_cap = 0
+
+    def _grow(self, T, B, ctok_need):
+        import torch
+
+        if self._hist is None or self._T_cap < T or self._B_cap < B:
+            T_cap = max(T, self._T_cap, 1)
+            self._hist = torch.empty(T_cap, B, dtype=torch.int32, device=self.device)
+            self._histapp = torch.empty(T_cap, B, dtype=torch.int32, device=self.device)
+
+            # NOTE: the kernels only fill tokens_out[0:L) per row.
+            self._tokens = torch.zeros(B, T_cap, dtype=torch.int64, device=self.device)
+
+            self._lens = torch.empty(B, dtype=torch.int32, device=self.device)
+            self._scores = torch.empty(B, dtype=torch.float32, device=self.device)
+
+            self._done = torch.zeros(1, dtype=torch.int32, device=self.device)
+
+            self._T_cap, self._B_cap = T_cap, B
+        if ctok_need > self._ctok_cap:
+            cap = max(ctok_need, self._ctok_cap, 1)
+
+            self._ctok = torch.empty(cap, dtype=torch.int64, device=self.device)
+            self._ctok_cap = cap
+
+    def get(self, T, B, C, cf):
+        """Returns (hist_par, hist_app, c_tok_flat|None, done, tokens, lens, scores)."""
+        import torch
+
+        ctok_need = C * B * cf if C > 1 else 0
+        self._grow(T, B, ctok_need)
+        self._done.zero_()
+        return (self._hist[:T], self._histapp[:T],
+                self._ctok[:ctok_need] if ctok_need else None,
+                self._done, self._tokens, self._lens, self._scores)
+
+
+def beam_search(ti, tv, beam=5, blank=0, chunk_frames=0, max_chunks=8, ws=None):
+    """Persistent CTC prefix beam over a top-k stream.
+
+    ti [T,K], tv [T,K] from ``torch.topk(logp, K, dim=-1)``
+
+    ``chunk_frames`` selects the kernel:
+      * 0/None — single-block baseline (exact ctc_prefix_beam_search; the lean
+        path for short utterances),
+      * >0     — multi-block cluster kernel: [0, T) splits into C chunks, each
+        block runs the same per-frame beam over its chunk, block 0 stitches
+        hypothesis j = concat(chunk-j rank-j) scoring via DSMEM peer state.
+        C=1 degenerates to the exact baseline.
+
+    ``ws`` (optional :class:`BeamWorkspace`) reuses GPU scratch across calls;
+    omit it to allocate per call. Returns (tokens [B,T], lens [B], scores [B]).
+    """
+    import torch
+
+    T, K = int(ti.shape[0]), int(ti.shape[1])
+    B = int(beam)
+    ti = ti.contiguous()
+    tv = tv.contiguous().float()
+    dev = ti.device
+
+    C = 1
+    if chunk_frames:
+        C = max(1, min(int(max_chunks),
+                       (T + int(chunk_frames) - 1) // int(chunk_frames)))
+
+    if ws is not None:
+        if C <= 1:
+            hist_par, hist_app, c_tok, done, tokens, lens, scores = ws.get(
+                T, B, 1, 0)
+            tokens = torch.zeros(B, T, dtype=torch.int64, device=dev)
+            mod = _beam_mod_legacy()
+            mod.beam_search(ti, tv, hist_par, hist_app, tokens, lens, scores,
+                            int(blank))
+            return tokens, lens, scores
+
+        cf = (T + C - 1) // C
+
+        hist_par = torch.empty(C, T, B, dtype=torch.int32, device=dev)
+        hist_app = torch.empty(C, T, B, dtype=torch.int32, device=dev)
+
+        # NOTE: the kernels only fill c_tok[0:L) per row.
+        c_tok = torch.zeros(C, B, cf, dtype=torch.int64, device=dev)
+        c_tok_len = torch.empty(C, B, dtype=torch.int32, device=dev)
+
+        done = torch.zeros(1, dtype=torch.int32, device=dev)
+
+        # NOTE: the kernels only fill tokens_out[0:L) per row.
+        tokens = torch.zeros(B, T, dtype=torch.int64, device=dev)
+
+        lens = torch.empty(B, dtype=torch.int32, device=dev)
+        scores = torch.empty(B, dtype=torch.float32, device=dev)
+
+        ov = min(64, cf // 4)
+
+        mod = _beam_mod()
+
+        mod.beam_search(ti, tv, hist_par, hist_app, c_tok, c_tok_len, done,
+                        tokens, lens, scores, C, cf, int(blank), ov)
+        return tokens[:, :T], lens, scores
+
+    # NOTE (yiakwy) : Deprecated path
+    hist_par = torch.empty(T, B, dtype=torch.int32, device=dev)
+    hist_app = torch.empty(T, B, dtype=torch.int32, device=dev)
+    
+    # NOTE: the kernels only fill tokens_out[0:L) per row.
+    tokens = torch.zeros(B, T, dtype=torch.int64, device=dev)
+
+    lens = torch.empty(B, dtype=torch.int32, device=dev)
+    scores = torch.empty(B, dtype=torch.float32, device=dev)
+
+    if C <= 1:
+        mod = _beam_mod_legacy()
+        mod.beam_search(ti, tv, hist_par, hist_app, tokens, lens, scores,
+                        int(blank))
+        return tokens, lens, scores
+
+    cf = (T + C - 1) // C
+
+    hist_par = torch.empty(C, T, B, dtype=torch.int32, device=dev)
+    hist_app = torch.empty(C, T, B, dtype=torch.int32, device=dev)
+
+    # NOTE: the kernels only fill c_tok[0:L) per row.
+    c_tok = torch.zeros(C, B, cf, dtype=torch.int64, device=dev)
+    c_tok_len = torch.empty(C, B, dtype=torch.int32, device=dev)
+
+    done = torch.zeros(1, dtype=torch.int32, device=dev)
+    ov = min(64, cf // 4)  # ~0.64s look-back/look-ahead for beam convergence
+
+    mod = _beam_mod()
+
+    mod.beam_search(ti, tv, hist_par, hist_app, c_tok, c_tok_len, done,
+                    tokens, lens, scores, C, cf, int(blank), ov)
+    return tokens[:, :T], lens, scores

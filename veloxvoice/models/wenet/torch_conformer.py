@@ -1,4 +1,4 @@
-"""Native torch.nn.Module implementation of WeNet's Conformer encoder + CTC head.
+"""Native torch.nn.Module implementation of WeNet style Conformer encoder + CTC head.
 
 Default torch backend : identical math to the
 MLX implementation (models/wenet/mlx_model.py) and to upstream WeNet numerics,
@@ -73,6 +73,20 @@ def _state_from_ts_archive(model_dir: str) -> dict:
     )
 
 
+def resolve_model_dir(model_dir: str) -> str:
+    """Apply the ``VELOXVOICE_ASR_CHECKPOINT`` export override."""
+    override = os.environ.get("VELOXVOICE_ASR_CHECKPOINT", "").strip()
+    if not override:
+        return model_dir
+    else:
+        pass
+    if os.path.basename(os.path.normpath(model_dir)) == override:
+        return model_dir
+    else:
+        pass
+    return override if os.path.isdir(override) else os.path.join(model_dir, override)
+
+
 def load_asr_state(model_dir: str) -> dict:
     """Load the checkpoint once for both vocabulary discovery and model init.
 
@@ -80,6 +94,7 @@ def load_asr_state(model_dir: str) -> dict:
     bundles are supported through the robust archive reader for hosts where
     ``torch.jit.load`` cannot deserialize quantized modules.
     """
+    model_dir = resolve_model_dir(model_dir)
     pt_path = _checkpoint_path(model_dir)
     if pt_path is not None:
         state = torch.load(pt_path, map_location="cpu", weights_only=False)
@@ -746,11 +761,10 @@ class WenetConformerASR:
         # NOTE (yiakwy) : torch, mlx backends
         self.backend = torch
 
-        # Tensor-core fp32 (tf32) matmul: cuDNN convs already run tf32 by
-        # default; leaving matmul at ieee pins every Linear/bmm to SIMT fp32
-        # (~8x slower than tf32 tensor cores on GB10).
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        # cuDNN convs fp32 is ~8x slower than SIMT tf32 tensor cores on GB10.
+        _tf32 = os.environ.get("VELOXVOICE_TF32", "1") == "1"
+        torch.backends.cuda.matmul.allow_tf32 = _tf32
+        torch.backends.cudnn.allow_tf32 = _tf32
 
         # NOTE (yiakwy) : targeted devices include cpu, nvgpu (amdgpu) and mlx (mps)
         self.device = device
@@ -770,11 +784,63 @@ class WenetConformerASR:
 
         self.global_cmvn_mean = state["encoder.global_cmvn.mean"].to(device)
         self.global_cmvn_istd = state["encoder.global_cmvn.istd"].to(device)
+
+        from .config import load_cmvn
+
+        cm_file = load_cmvn(self.model_dir)
+        if cm_file is None:
+            pass
+        elif os.environ.get("VELOXVOICE_CMVN", "embedded").lower() == "file":
+            self.global_cmvn_mean = torch.tensor(
+                cm_file[0], device=device, dtype=self.global_cmvn_mean.dtype)
+            self.global_cmvn_istd = torch.tensor(
+                cm_file[1], device=device, dtype=self.global_cmvn_istd.dtype)
+        else:
+            dmean = (torch.as_tensor(cm_file[0], device=device) - self.global_cmvn_mean).abs().max()
+            distd = (torch.as_tensor(cm_file[1], device=device) - self.global_cmvn_istd).abs().max()
+            if float(dmean) > 1e-3 or float(distd) > 1e-3:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "global_cmvn file vs embedded CMVN mismatch: "
+                    "max|Δmean|=%.3g max|Δistd|=%.3g (set VELOXVOICE_CMVN=file)",
+                    float(dmean), float(distd))
+            else:
+                pass
         self.ctc_lo = (
             DenseLinear(state["ctc.ctc_lo.weight"], state["ctc.ctc_lo.bias"])
             .to(device)
             .eval()
         )
+
+        # NOTE (yiakwy) : attn rescore parameters
+        self.attention_decoder = None
+        try:
+            from .attention_decoder import build_bi_transformer_decoder
+
+            heads = self.cfg.attention_heads
+            dec_state = None
+            bundle = os.path.join(self.model_dir, "offline")
+            if not os.path.exists(os.path.join(bundle, "final.zip")):
+                bundle = self.model_dir
+            if os.path.exists(os.path.join(bundle, "final.zip")):
+                from .ts_archive import read_ts_archive_tensor_map
+
+                ts_state = read_ts_archive_tensor_map(
+                    os.path.join(bundle, "final.zip"))
+                dec_state = {
+                    k.split("model.decoder.", 1)[1]: v
+                    for k, v in ts_state.items()
+                    if k.startswith("model.decoder.")
+                }
+            if not dec_state:
+                dec_state = {k[len("decoder."):]: v for k, v in state.items()
+                             if k.startswith("decoder.")}
+            if dec_state:
+                self.attention_decoder = build_bi_transformer_decoder(
+                    dec_state, num_heads=heads).to(device).eval()
+        except Exception:
+            self.attention_decoder = None
 
     def load_state_dict(self, sd, strict: bool = False):
         _normalize = torch_state_dict
@@ -886,6 +952,7 @@ class WenetConformerASR:
         self._graphs_enabled = True
         self._max_graphs = int(max_graphs)
         self._graphs = {}
+        self._enc_graphs = {}
         self._graph_pool = self.backend.cuda.graph_pool_handle()
 
     def encode_ctc_utterance(self, feats):
@@ -999,3 +1066,23 @@ class WenetConformerASR:
                 return self.ctc_logp(self.encode_utterance(feats))
         self._graphs[key] = (static_in, graph, static_out)
         return static_out.clone()
+
+    def encode_utterance_graphed(self, feats):
+        """Encoder output for the rescoring path.
+
+        NOTE (yiakwy): Per-shape CUDA graph capture of ``encode_utterance`` was
+        attempted, but the large full-context shapes forced eager allocation during
+        capture and triggered an illegal-address fault. 
+        
+        As a result, the encoder runs eagerly here; only the greedy path keeps its 
+        own ``encode_ctc`` graph. 
+        
+        Revisit with a dedicated capture pool once the shape issue is resolved.
+        """
+        p = next(self.encoder.parameters())
+        if feats.dtype != p.dtype:
+            feats = feats.to(p.dtype)
+        else:
+            pass
+        with self.backend.inference_mode():
+            return self.encode_utterance(feats)

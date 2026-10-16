@@ -13,6 +13,26 @@ from .runtime.device import detect_platform
 
 _SAMPLE_RATE = 16000
 
+# NOTE(yiakwy) : Global precision switch `VELOXVOICE_PRECISION` overrides 
+# the per-call default precision.
+#
+#   fp16  fp32 weights + autocast-fp16 encoder   (lower accuracy, 13.17%)
+#   bf16  bf16 weights + encoder                 (default)
+#   fp32  full fp32, no autocast                 (higher accuracy)
+#   nvfp4 / mxfp4                                (quantized lane, device-gated)
+PRECISION_MODES = ("fp16", "bf16", "fp32", "nvfp4", "mxfp4")
+
+
+def resolve_precision(default: str = "bf16") -> str:
+    """Return the effective precision; env `VELOXVOICE_PRECISION` wins."""
+    mode = os.environ.get("VELOXVOICE_PRECISION", "").strip().lower()
+    mode = mode or default
+    if mode not in PRECISION_MODES:
+        raise ValueError(f"VELOXVOICE_PRECISION={mode!r} not in {PRECISION_MODES}")
+    else:
+        pass
+    return mode
+
 
 @dataclass
 class TranscriptionResult:
@@ -108,7 +128,12 @@ class Velox:
         from .audio import FrontendConfig
 
         # TODO (yiakwy) : user can adjust sample rate via restful API and frontend config
-        fcfg = FrontendConfig(sample_rate=_SAMPLE_RATE, num_mel_bins=cfg.input_dim)
+        mode = resolve_precision(kernel_precision)
+        fcfg = FrontendConfig(
+            sample_rate=_SAMPLE_RATE,
+            num_mel_bins=cfg.input_dim,
+            precision=("fp32" if mode == "fp32" else "bf16"),
+        )
         device = device or platform.device
 
         if platform.module_backend == "torch":
@@ -132,8 +157,12 @@ class Velox:
             factory = lambda: None  # state lives inside the recognizer session
 
             if native_kernels and hasattr(model, "set_precision"):
-                model.set_precision(kernel_precision)
-                model.set_jit(True)
+                if mode == "fp16":
+                    model.set_precision("fp32")
+                    model.set_fp16(True)
+                else:
+                    model.set_precision(mode)
+                model.set_jit(os.environ.get("VELOXVOICE_JIT", "1") == "1")
             if enable_graphs and hasattr(model, "enable_graphs"):
                 model.enable_graphs()
         else:
@@ -177,7 +206,7 @@ class Velox:
             text_tok,
             cfg,
             use_graphs=use_graphs,
-            precision=kernel_precision,
+            precision=resolve_precision(kernel_precision),
             enable_graphs=enable_graphs,
         )
 
@@ -195,9 +224,7 @@ class Velox:
             if self._warmed:
                 return self
             with torch.inference_mode():
-                from .audio import make_frontend
-
-                fe = make_frontend(self._frontend_cfg, device=self.platform.device)
+                fe = self._get_frontend()
                 for sec in dict.fromkeys(seconds):
 
                     samples = int(round(_SAMPLE_RATE * float(sec)))
@@ -217,18 +244,30 @@ class Velox:
             if self.platform.device.startswith("cuda"):
                 torch.cuda.synchronize()
 
+            # NOTE (yiakwy) : Pre-build the rescoring module + GPU buffers workspace
+            try:
+                self._get_rescorer()
+            except Exception:
+                pass
+
             self._warmed = True
         return self
 
     # our main API refactored from old codes
     def transcribe_pcm(
-        self, pcm, sample_rate: int = _SAMPLE_RATE
+        self, pcm, sample_rate: int = _SAMPLE_RATE, decode: str | None = None
     ) -> TranscriptionResult:
         """Full-context transcribe from mono float PCM in [-1, 1].
 
-        Other sample rates are resampled with ffmpeg.  This is the benchmark-
-        equivalent API lane: frontend -> low-energy spans -> native encoder +
-        CTC collapse, all in-process.
+        Other sample rates are resampled on GPU instead of ffmpeg on CPU. 
+        
+        This is the benchmark-equivalent API pathway:
+        frontend -> low-energy spans -> native encoder + CTC collapse, all
+        in-process.
+
+        ``decode`` overrides the decode pathway for this call ("greedy" |
+        "att_rescore"); ``None`` falls back to ``$VELOXVOICE_DECODE``, i.e.
+        "greedy".
         """
         if sample_rate != _SAMPLE_RATE:
             pcm = _resample_pcm16k(pcm, sample_rate)
@@ -247,25 +286,25 @@ class Velox:
 
         started = perf_counter()
         with self._lock:
-            from .audio import make_frontend
-
-            fe = make_frontend(self._frontend_cfg, device=self.platform.device)
+            fe = self._get_frontend()
             with torch.inference_mode():
                 feats = torch.cat([fe.accept(pcm_t), fe.flush()], dim=0)
             spans = self._spans_for(feats, pcm_t)
 
-            # On-device CTC collapse: only the compact token list is copied back.
-            ids: list[int] = []
-            last = 0
-            with torch.inference_mode():
-                for start, end in spans:
-                    logp = self._model.encode_ctc_utterance(feats[start:end][None])
-                    frame_ids = logp[0].argmax(-1).reshape(-1)
-                    prev = torch.cat((frame_ids.new_full((1,), last), frame_ids[:-1]))
-                    keep = (frame_ids != 0) & (frame_ids != prev)
-                    ids.extend(frame_ids[keep].cpu().tolist())
-                    if frame_ids.numel():
-                        last = int(frame_ids[-1])
+            # # On-device CTC collapse: only the compact token list is copied back.
+            # ids: list[int] = []
+            # last = 0
+            # with torch.inference_mode():
+            #     for start, end in spans:
+            #         logp = self._model.encode_ctc_utterance(feats[start:end][None])
+            #         frame_ids = logp[0].argmax(-1).reshape(-1)
+            #         prev = torch.cat((frame_ids.new_full((1,), last), frame_ids[:-1]))
+            #         keep = (frame_ids != 0) & (frame_ids != prev)
+            #         ids.extend(frame_ids[keep].cpu().tolist())
+            #         if frame_ids.numel():
+            #             last = int(frame_ids[-1])
+            
+            ids = self._decode_spans(feats, spans, decode=decode)
             if self.platform.device.startswith("cuda"):
                 torch.cuda.synchronize()
         elapsed = perf_counter() - started
@@ -277,6 +316,102 @@ class Velox:
             audio_seconds=audio_seconds,
             elapsed_seconds=elapsed,
         )
+
+    def _ensure_decoder(self):
+        """Lazily load the torchscript attention decoder used for rescoring."""
+        decoder = getattr(self, "_attention_decoder", None)
+        if decoder is not None:
+            return decoder or None
+        else:
+            pass
+        from .stream.rescore import load_attention_decoder
+
+        try:
+            decoder = load_attention_decoder(
+                self._model, str(self.platform.device)) or False
+        except Exception:
+            decoder = False
+        self._attention_decoder = decoder
+        return decoder or None
+
+    def _get_rescorer(self):
+        """Cached ``AttRescorer`` (preallocated buffers) for the rescoring lane."""
+        rs = getattr(self, "_rescorer", None)
+        if rs is not None:
+            return rs
+        import os
+
+        from .stream.rescore import AttRescorer
+
+        decoder = self._ensure_decoder()
+        if decoder is None:
+            return None
+        dim = int(getattr(self._model.cfg, "output_size", 512))
+        rs = AttRescorer(
+            decoder,
+            beam=int(os.environ.get("VELOXVOICE_BEAM", "5")),
+            ctc_weight=float(os.environ.get("VELOXVOICE_CTC_WEIGHT", "0.5")),
+            dim=dim,
+            device=str(self.platform.device),
+            search=os.environ.get("VELOXVOICE_BEAM_BACKEND", "jit_kernel"),
+        )
+        self._rescorer = rs
+        return rs
+
+    def _decode_spans(self, feats, spans, decode: str | None = None) -> list[int]:
+        """Greedy CTC collapse, or WeNet attention_rescoring.
+
+        ``decode`` overrides ``$VELOXVOICE_DECODE`` for this call.
+        """
+        import os
+
+        import torch
+
+        # RESCORE=1 routes the default lane to attention rescoring (the API
+        # per-request params — curl `rescore` field / ws `rescore` — override it)
+        default_decode = "greedy"
+        if os.environ.get("RESCORE", "0") == "1" and not os.environ.get("VELOXVOICE_DECODE"):
+            default_decode = "att_rescore"
+        mode = (decode or os.environ.get("VELOXVOICE_DECODE", default_decode)).lower()
+        rescorer = self._get_rescorer() if mode != "greedy" else None
+        ids: list[int] = []
+        last = 0
+        with torch.inference_mode():
+            for start, end in spans:
+                if rescorer is not None:
+                    try:
+                        enc_fn = getattr(self._model, "encode_utterance_graphed",
+                                         self._model.encode_utterance)
+                        enc = enc_fn(feats[start:end][None])
+                        logp = self._model.ctc_logp(enc)
+                        ids.extend(rescorer.decode(enc, logp[0]))
+                        continue
+                    except Exception:
+                        pass
+                else:
+                    pass
+                logp = self._model.encode_ctc_utterance(feats[start:end][None])
+                frame_ids = logp[0].argmax(-1).reshape(-1)
+                prev = torch.cat((frame_ids.new_full((1,), last), frame_ids[:-1]))
+                keep = (frame_ids != 0) & (frame_ids != prev)
+                ids.extend(frame_ids[keep].cpu().tolist())
+                if frame_ids.numel():
+                    last = int(frame_ids[-1])
+                else:
+                    pass
+        return ids
+
+    def _get_frontend(self):
+        """Reused frontend (frontends reset their state on ``flush``)."""
+        fe = getattr(self, "_frontend_obj", None)
+        if fe is None:
+            from .audio import make_frontend
+
+            fe = make_frontend(self._frontend_cfg, device=self.platform.device)
+            self._frontend_obj = fe
+        else:
+            pass
+        return fe
 
     def _spans_for(self, feats, pcm) -> list[tuple[int, int]]:
         import torch
@@ -315,10 +450,8 @@ class Velox:
         if pcm_t.numel() == 0:
             return torch.empty(0, 0), self.cfg.subsampling
 
-        from .audio import make_frontend
-
         with self._lock, torch.inference_mode():
-            fe = make_frontend(self._frontend_cfg, device=self.platform.device)
+            fe = self._get_frontend()
             feats = torch.cat([fe.accept(pcm_t), fe.flush()], dim=0)
             spans = self._spans_for(feats, pcm_t)
             pieces = [
@@ -335,12 +468,15 @@ class Velox:
         pcm_iter: Iterable[Any],
         sample_rate: int = _SAMPLE_RATE,
         pool_seconds: float = 20.0,
+        decode: str | None = None,
     ) -> Iterator[TranscriptionResult]:
         """Stream pooled full-context transcriptions from 16 kHz mono PCM.
 
         For incremental input, pool enough audio before invoking the encoder.
         Other sample rates should first be decoded/resampled as one stream;
         chunk-wise resampling would create filter-boundary artifacts.
+
+        ``decode`` is forwarded to :meth:`transcribe_pcm`.
         """
         if sample_rate != _SAMPLE_RATE:
             raise ValueError("transcribe_pcm_iter requires 16 kHz mono PCM")
@@ -359,12 +495,12 @@ class Velox:
                 pcm = np.concatenate(buffer)
                 piece = pcm[:target]
                 rest = pcm[target:]
-                yield self.transcribe_pcm(piece)
+                yield self.transcribe_pcm(piece, decode=decode)
                 buffer = [rest] if rest.size else []
                 buffered = int(rest.size)
 
         if buffered:
-            yield self.transcribe_pcm(np.concatenate(buffer))
+            yield self.transcribe_pcm(np.concatenate(buffer), decode=decode)
 
     def transcribe(self, pcm, chunk_frames: int | None = None) -> str:
         """Compatibility API returning plain text."""
@@ -466,14 +602,31 @@ def _vocab_from_state(state: dict, default: int) -> int:
 
 
 def _resample_pcm16k(pcm, sample_rate: int):
-    """Small dependency-free HTTP/WebRTC helper."""
-    import io
-    import subprocess
-    import wave
+    """Resample mono float PCM to 16 kHz.
 
+    For better serving RTF we use on-chip sampling, ffmpeg stays as the
+    CPU fallback (~145 ms for a 100 s audio clip).
+    """
     pcm_np = np.asarray(pcm, dtype=np.float32).reshape(-1)
     if sample_rate == _SAMPLE_RATE:
         return pcm_np
+
+     # NOTE (yiakwy) : torch >= 2.13.0+cu13.0 for on chip sampling
+    import torch
+
+    if torch.cuda.is_available():
+        import torchaudio.functional as AF
+
+        with torch.inference_mode():
+            out = AF.resample(
+                torch.from_numpy(pcm_np).to("cuda"), int(sample_rate), _SAMPLE_RATE)
+        return out.cpu().numpy()
+    else:
+        pass
+
+    import io
+    import subprocess
+    import wave
 
     pcm_i16 = np.clip(pcm_np * 32768.0, -32768, 32767).astype(np.int16)
     buf = io.BytesIO()
