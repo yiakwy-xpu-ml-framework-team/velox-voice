@@ -1,4 +1,4 @@
-# Accuracy — VeloxVoice-opt
+# Accuracy
 
 AISHELL-4 local set, 1277 utterances, reference = `text.revised` (human GT).
 Metric of record: **corpus CER = total char edits / total reference chars**

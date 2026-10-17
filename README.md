@@ -33,7 +33,7 @@ This repository is porting our "Flash Float JIT Kernels" into audio tasks. Besid
   <video src="https://github.com/user-attachments/assets/31c056a7-1d24-49e4-bf59-a439004f4b20" width="60%"> </video>
 </div>
 
-Prior VeloxVoice, transcribing long audio with wenet alike model (Conformerencoder + CTC) suffers from extremely computation imbalance.
+Prior VeloxVoice, transcribing long audio with wenet alike model (Conformer encoder + CTC) suffers from extremely computation imbalance.
 
 Take the [power mel log](https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/pull/33) for example, the task typically involves a matrix of shape **[T, M]**, where **M** is **80** and depends on the audio sampling rate, while **T** represents the number of frames and depends on the duration of the audio. As a result, for a long audio inputs, traditional torch GEMM does not handle this computation characteristics efficiently.
 
@@ -219,8 +219,9 @@ curl -N -X POST http://localhost:8000/v1/audio/transcriptions \
   - `velox_layernorm`, `velox_silu_glu`, `velox_depthwise_causal_conv1d` : opt w/ NoC
   - `velox_chunk_rel_pos_attn` : masked rel-pos multi-head attention (opt WIP)
   - `velox_fused_qkv` : small-m fused GEMV
+  - `velox_prefix_beam_search` : to our best knowledge, the first gpu parallel implementation of ctc prefix beam search accelerated by our Multi Chunks (blocks) Parallel beams w/ NoC
   - `flash-float-jit-kernel` libs
-    - `distRadixTopK` : ctc produce [T, 14128] logits, our exact match topk is good to deal with this kind of sequence length
+    - `distRadixTopK` : ctc produce [T, 14128] logits, our exact match topk is good at dealing long seqeunces
 - csrc/dgx/ (DGX-Spark sm_121a):
   - **WASP 1p2c packed nvfp4/mxfp4 GEMM** with NoC and warp level m16n8k64
     `mma.sync.aligned.kind::mxf4nvf4.block_scale` with e8m0 scales.
