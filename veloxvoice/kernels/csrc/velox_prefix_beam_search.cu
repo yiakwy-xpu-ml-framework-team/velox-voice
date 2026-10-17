@@ -1,5 +1,7 @@
 // velox_prefix_beam_search.cu
-// Multi-block CLUSTER CTC prefix beam search (EXPERIMENT).
+// Multi-block CLUSTER CTC prefix beam search.
+//
+// Author : yiakwang@ust.hk
 //
 // This variant launches C blocks thread-block cluster :
 //   1. the cross-block barrier (cluster.sync() — no global atomics), and
@@ -16,7 +18,7 @@
 //     scoring each chunk's rank-j candidate by the peer's logadd(s, ns) read over
 //     DSMEM. 
 // 
-// C=1 degenerates to the exact baseline.
+// C=1 degenerates to the legacy approach exactly.
 
 #include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/tvm_ffi.h>
@@ -322,17 +324,17 @@ __global__ void PrefixBeamChunksKernel(
 
 }  // namespace
 
-void velox_beam_mp_impl(tvm::ffi::TensorView ti /*topK token_ids*/, tvm::ffi::TensorView tv /*topK candidates log probs*/,
-                        tvm::ffi::TensorView hist_par /*[C, T, B], parent per beam per frame*/, 
-                        tvm::ffi::TensorView hist_app /*[C, T, B], appended tokens per beam per frame*/,
-                        tvm::ffi::TensorView c_tok /*[C, B, cf], owned tokens per beam per frame*/, 
-                        tvm::ffi::TensorView c_tok_len  /*[C, B], count of owend tokens per beam per frame*/,
-                        tvm::ffi::TensorView done,
-                        tvm::ffi::TensorView tokens_out /*[B, Lmax], N-best token sequences*/, 
-                        tvm::ffi::TensorView lens_out   /*[B,], length per N-best token sequences*/,
-                        tvm::ffi::TensorView scores_out /*[B,], scores per N-best token sequences*/,
-                        int64_t nchunks, int64_t chunk_frames, int64_t blank,
-                        int64_t ov) {
+void velox_beam_search_impl(tvm::ffi::TensorView ti /*topK token_ids*/, tvm::ffi::TensorView tv /*topK candidates log probs*/,
+                            tvm::ffi::TensorView hist_par /*[C, T, B], parent per beam per frame*/, 
+                            tvm::ffi::TensorView hist_app /*[C, T, B], appended tokens per beam per frame*/,
+                            tvm::ffi::TensorView c_tok /*[C, B, cf], owned tokens per beam per frame*/, 
+                            tvm::ffi::TensorView c_tok_len  /*[C, B], count of owend tokens per beam per frame*/,
+                            tvm::ffi::TensorView done,
+                            tvm::ffi::TensorView tokens_out /*[B, Lmax], N-best token sequences*/, 
+                            tvm::ffi::TensorView lens_out   /*[B,], length per N-best token sequences*/,
+                            tvm::ffi::TensorView scores_out /*[B,], scores per N-best token sequences*/,
+                            int64_t nchunks, int64_t chunk_frames, int64_t blank,
+                            int64_t ov) {
   const int T = ti.size(0);
   const int K = ti.size(1);
 
@@ -407,4 +409,4 @@ void velox_beam_mp_impl(tvm::ffi::TensorView ti /*topK token_ids*/, tvm::ffi::Te
 #endif // Hopper 900+ GPU with cluster/NoC support
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(beam_search, velox_beam_mp_impl);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(beam_search, velox_beam_search_impl);
