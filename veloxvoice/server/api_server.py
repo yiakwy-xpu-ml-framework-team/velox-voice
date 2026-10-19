@@ -465,12 +465,34 @@ class _AudioStreamSession:
 
 # TODO (yiakwy) : move api and test server to different files
 def _music_warmup_by_model(model, device):
-    """Trigger cuDNN/allocator warmup for the music recognition."""
+    """Trigger cuDNN/allocator warmup for the music recognition AND prime the
+    AR decode path (grammar FSM tables + weight pack + CUDA-graph capture).
+
+    Without the decode warmup the first real request pays the one-time
+    ``build_grammar_tables`` cost (~8 s) plus the graph capture."""
     import torch as _t
 
     dummy = _t.zeros(1, int(model.cfg.input_audio_length * 24000), device=device)
     with _t.inference_mode():
-        model.encode(dummy)
+        mem = model.encode(dummy)
+        try:
+            from veloxvoice.models.sheetsage.v2 import api as sheetsage_api
+            from veloxvoice.stream.grammar_ar_decode import FULL_TASK_PROMPTS
+
+            prompts = model.tokenizer.normalize_prompts(FULL_TASK_PROMPTS)
+            if sheetsage_api._decode_engine() == "pipeline" \
+                    and getattr(model, "_graphed", None) is not None:
+                from veloxvoice.models.sheetsage.v2.step_pipeline import (
+                    transcribe_window_multi)
+
+                transcribe_window_multi(model, dummy, prompts, 8, memory=mem)
+            else:
+                from veloxvoice.stream.grammar_ar_decode import (
+                    build_grammar_tables)
+
+                build_grammar_tables(model.tokenizer, prompts, str(device))
+        except Exception:
+            pass
     _t.cuda.synchronize()
 
 
