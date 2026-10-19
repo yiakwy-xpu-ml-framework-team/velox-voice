@@ -1,7 +1,7 @@
 """Transcribe audio through the public VeloxVoice API.
 
 Examples:
-  # full-context transcription (same speed path as tools/bench_wenet_multi_worker.py)
+  # full-context transcription (for maximum speed see tools/bench_wenet_multi_worker.py)
   python examples/transcribe.py --model-dir data/models/asr_model \
       --audio speaker_test/meeting-test.wav
 
@@ -14,8 +14,13 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 SAMPLING_RATE = 16_000
 
@@ -62,9 +67,9 @@ def main() -> None:
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--precision", default="bf16", choices=("bf16", "fp32"))
-    ap.add_argument("--enable-graphs", action="store_true")
+    ap.add_argument("--enable-graphs", action="store_true", default=True)
+    ap.add_argument("--disable-graphs", dest="enable_graphs", action="store_false")
     ap.add_argument("--pool-seconds", type=float, default=20.0)
-    ap.add_argument("--rtf-goal", type=float, default=0.05)
     ap.add_argument(
         "--stream",
         action="store_true",
@@ -86,6 +91,10 @@ def main() -> None:
     )
 
     if not args.stream:
+        # NOTE (yiakwy) : warm up before timing to build jit kernels, and graph captures
+        vx.transcribe_pcm(pcm)
+
+        # NOTE (yiakwy) : timing execution
         result = vx.transcribe_pcm(pcm)
         print(
             f"[platform={vx.platform.name} backend={vx.platform.module_backend} "
@@ -94,8 +103,7 @@ def main() -> None:
         print(f"\nfinal ({len(result.text)} chars):\n  {result.text}")
         print(
             f"\nencode+ctc: {result.elapsed_seconds:.3f}s  "
-            f"RTF={result.rtf:.4f} target={args.rtf_goal} "
-            f"{'PASS' if result.rtf < args.rtf_goal else 'FAIL'}"
+            f"RTF={result.rtf:.5f}"
         )
         return
 
