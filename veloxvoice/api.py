@@ -107,8 +107,49 @@ class Velox:
         native_kernels: bool = True,
         kernel_precision: str = "bf16",
         enable_graphs: bool = False,
+        base_model_dir: str = "",
+    ):
+        """Load ASR (Audio Symbol Recognition) model through the public API with optimized JIT kernels."""
+        import json as _json
+
+        kind = None
+        cfg_path = os.path.join(model_dir, "config.json")
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, encoding="utf-8") as fh:
+                    kind = _json.load(fh).get("model_type")
+            except (OSError, ValueError):
+                kind = None
+        
+        if kind == "sheetsage2":
+            base = base_model_dir
+            if not base:
+                raise ValueError(
+                    "SheetSage2 model requires base_model_dir of MERT-v2.")
+            return VeloxMusic.load(model_dir, base)
+        
+        # NOTE (yiakwy) : defaults to WenetConformerASR, QwenASR will be supported soon
+        return cls._load_asr(
+            model_dir, backend, device, cache_frames, use_graphs,
+            native_kernels=native_kernels,
+            kernel_precision=kernel_precision,
+            enable_graphs=enable_graphs,
+        )
+
+    @classmethod
+    def _load_asr(
+        cls,
+        model_dir: str,
+        backend: str = "auto",
+        device: str | None = None,
+        cache_frames: int = 256,
+        use_graphs: str = "eager",
+        *,
+        native_kernels: bool = True,
+        kernel_precision: str = "bf16",
+        enable_graphs: bool = False,
     ) -> "Velox":
-        """Load a WeNet bundle with the public API with optimized kernels"""
+        """Load a WeNet style conformer with the public API with optimized kernels"""
         from .models.wenet.config import load_cmvn, load_config
         from .runtime.device import detect_platform
 
@@ -508,6 +549,55 @@ class Velox:
         return self.transcribe_pcm(pcm).text
 
 
+class VeloxMusic(Velox):
+    """Auto Symbol Recognition for Music: 
+    
+    ``vx.transcribe(audio)`` : SheetSage2 lead-sheet result.
+    """
+
+    def __init__(self, model, dtype: str = "bf16"):
+        self._music_model = model
+        self.dtype = dtype
+        self.kind = "sheetsage2"
+        self.model_dir = getattr(model.cfg, "model_dir", "")
+
+    @classmethod
+    def load(cls, model_dir: str, base_model_dir: str,
+             dtype: str = "bf16", device: str = "cuda"):
+        from .models.sheetsage.v2 import api as sheetsage_api
+
+        model = sheetsage_api.load_model(model_dir, base_model_dir, dtype,
+                                         device)
+        vx = cls(model, dtype=dtype)
+        vx._transcribe_fn = sheetsage_api.transcribe
+        return vx
+
+    def transcribe(self, audio, output_dir=None, **kwargs):
+        return self._transcribe_fn(self._music_model, audio,
+                                   output_dir=output_dir, **kwargs)
+
+    def transcribe_pcm(self, pcm, sample_rate: int = 24000, **kwargs):
+        import numpy as np
+        import torch
+
+        if isinstance(pcm, torch.Tensor):
+            pcm = pcm.detach().cpu().numpy()
+        
+        pcm = np.asarray(pcm)
+
+        if pcm.ndim == 2:
+            pcm = pcm.mean(axis=0)
+
+        pcm = _resample_pcm24k(pcm, sample_rate)
+        return self.transcribe(pcm, sampling_rate=_MUSIC_SAMPLE_RATE, **kwargs)
+
+    def transcribe_pcm_iter(self, *args, **kwargs):
+        raise NotImplementedError("Auto Symbol Recognition for Music: use transcribe/transcribe_pcm")
+
+    def new_session(self, *args, **kwargs):
+        raise NotImplementedError("Auto Symbol Recognition for Music: use transcribe/transcribe_pcm")
+
+
 class StreamingSession:
     def __init__(self, velox: Velox, chunk_frames: int):
         from .audio import make_frontend
@@ -532,6 +622,7 @@ class StreamingSession:
                 from .graphs.chunk_pipeline import MlxCompiledChunkRunner
 
                 model = MlxCompiledChunkRunner(model, mode="metal-graph")
+        
         self._v = velox
         self._r = StreamingRecognizer(
             model,
@@ -651,6 +742,55 @@ def _resample_pcm16k(pcm, sample_rate: int):
             "f32le",
             "-",
         ],
+        input=buf.getvalue(),
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
+_MUSIC_SAMPLE_RATE = 24000
+
+
+def _resample_pcm24k(pcm, sample_rate: int):
+    """Resample mono float PCM to 24 kHz.
+
+    Simliar to _resample_pcm16k : on-chip GPU resample first,
+    ffmpeg subprocess as the CPU fallback.
+
+    Follow QwenMusic/Yue 2 frequency convention.
+    """
+    pcm_np = np.asarray(pcm, dtype=np.float32).reshape(-1)
+    if sample_rate == _MUSIC_SAMPLE_RATE:
+        return pcm_np
+
+    import torch
+
+    if torch.cuda.is_available():
+        import torchaudio.functional as AF
+
+        with torch.inference_mode():
+            out = AF.resample(
+                torch.from_numpy(pcm_np).to("cuda"), int(sample_rate),
+                _MUSIC_SAMPLE_RATE)
+        return out.cpu().numpy()
+
+    import io
+    import subprocess
+    import wave
+
+    pcm_i16 = np.clip(pcm_np * 32768.0, -32768, 32767).astype(np.int16)
+    
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm_i16.tobytes())
+
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", "pipe:0", "-ac", "1",
+         "-ar", f"{_MUSIC_SAMPLE_RATE}", "-f", "f32le", "-"],
         input=buf.getvalue(),
         stdout=subprocess.PIPE,
         check=True,

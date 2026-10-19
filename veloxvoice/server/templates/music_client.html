@@ -1,0 +1,958 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>VeloxVoice ASR Client</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 15px/1.5 system-ui,sans-serif; max-width: 900px; margin: 30px auto; }
+    h1 { font-size: 22px; margin-bottom: 14px; }
+    .card { background: #f7f7f8; border-radius: 12px; padding: 18px; }
+    .drop { border: 2px dashed #bbb; border-radius: 10px; padding: 22px; text-align: center; cursor: pointer; }
+    .drop.drag { border-color: #10a37f; background: #e8f7f2; }
+    button { font-size: 15px; padding: 8px 14px; border-radius: 8px; border: 0; background: #10a37f; color: white; cursor: pointer; }
+    button.live { background: #7c3aed; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    input[type=file] { display: none; }
+    select { padding: 6px; border-radius: 6px; }
+    .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+    .progress-label { display: flex; justify-content: space-between; gap: 10px; color: #555; font-size: 13px; margin-top: 6px; }
+    .progress { height: 6px; background: #ddd; border-radius: 3px; overflow: hidden; margin-top: 12px; }
+    .progress > div { height: 100%; width: 0%; background: #10a37f; transition: width .2s; }
+    #asrBar { background: #7c3aed; }
+    pre { white-space: pre-wrap; background: #0f172a; color: #d1d5db; padding: 14px; border-radius: 8px; min-height: 150px; }
+    .meta { color: #666; font-size: 13px; margin-top: 8px; }
+    #musicPanel .progress { height: 6px; background: #ddd; border-radius: 3px;
+      overflow: hidden; margin-top: 12px; }
+    #musicPanel .progress > div { height: 100%; width: 0%;
+      background: #10a37f; transition: width .2s; }
+    #musicPanel .progress-label { display: flex; justify-content: space-between;
+      gap: 10px; color: #555; font-size: 13px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div style="display:flex;gap:0;margin-bottom:14px;max-width:900px;margin-left:auto;margin-right:auto;margin-bottom:14px">
+    <button id="tabAsr" onclick="showTab('asr')" style="flex:1;padding:10px;font-size:15px;background:#10a37f;color:#fff;border:1px solid #10a37f;border-radius:8px 0 0 8px;cursor:pointer;font-weight:600">ASR (Vocal)</button>
+    <button id="tabMusic" onclick="showTab('music')" style="flex:1;padding:10px;font-size:15px;background:#e8e8ec;color:#666;border:1px solid #ddd;border-radius:0 8px 8px 0;cursor:pointer">AMR (Audio Melody Recognition) + Vocal</button>
+  </div>
+  <div id="asrPanel">
+  <h1>VeloxVoice ASR Client</h1>
+  <div class="card">
+    <div class="drop" id="drop">
+      <b>Select audio</b><br>
+      <small>MP3, WAV, FLAC, M4A, OGG, MP4…</small>
+    </div>
+    <input type="file" id="file" accept="audio/*,video/*" />
+    <div class="actions">
+      <select id="pool">
+        <option value="5" selected>5s pool</option>
+        <option value="10">10s pool</option>
+        <option value="20">20s pool</option>
+        <option value="30">30s pool</option>
+      </select>
+      <label id="rescoreLabel" title="attention rescoring (slower, slightly more accurate)">
+        <input type="checkbox" id="rescore" /> rescore
+      </label>
+      <button id="uploadBtn" disabled>Upload</button>
+      <button id="transcribeBtn" disabled>Transcribe (after uploading)</button>
+      <button id="webrtcBtn" class="live" disabled>Transcribing (WebRTC)</button>
+    </div>
+
+    <div class="progress"><div id="uploadBar"></div></div>
+    <div class="progress-label"><span id="uploadLabel">Upload</span><span id="uploadStatus">Idle</span></div>
+
+    <div class="progress"><div id="asrBar"></div></div>
+    <div class="progress-label"><span id="asrLabel">Transcribing</span><span id="asrStatus">Idle</span></div>
+
+    <pre id="out">Waiting for audio…</pre>
+    <div class="meta">
+      API docs: <code>/docs</code>. Live streaming: <code>/v1/audio/ws</code>.
+      Live mode emits a short 1s first partial, then uses the selected pool cadence.
+    </div>
+  </div>
+<script>
+function showTab(t) {
+  document.getElementById('asrPanel').style.display = t === 'asr' ? 'block' : 'none';
+  document.getElementById('musicPanel').style.display = t === 'music' ? 'block' : 'none';
+  document.getElementById('tabAsr').style.background = t === 'asr' ? '#10a37f' : '#e8e8ec';
+  document.getElementById('tabAsr').style.color = t === 'asr' ? '#fff' : '#666';
+  document.getElementById('tabMusic').style.background = t === 'music' ? '#10a37f' : '#e8e8ec';
+  document.getElementById('tabMusic').style.color = t === 'music' ? '#fff' : '#666';
+}
+
+// ── prevent browser from opening dropped files (page-level) ──
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => e.preventDefault());
+
+// ── AMR (music transcription) — two-step flow matching ASR ──
+let musicFile = null, musicUploadedId = null, svgPages = [], curPage = 0;
+let musicBusy = false;
+const $m = id => document.getElementById(id);
+
+function musicSetProgress(bar, percent) {
+  const el = $m(bar);
+  if (el) el.style.width = Math.max(0, Math.min(100, percent)) + '%';
+}
+
+function musicSetButtons() {
+  $m('musicUploadBtn').disabled = musicBusy || !musicFile;
+  $m('musicTranscribeBtn').disabled = musicBusy || !musicUploadedId;
+}
+
+function musicResetForFile(file) {
+  musicFile = file;
+  musicUploadedId = null;
+  musicSetProgress('musicUploadBar', 0);
+  $m('musicUploadLabel').textContent = 'Upload';
+  $m('musicUploadStatus').textContent = file ? 'Selected' : 'Idle';
+  musicSetProgress('musicDecodeBar', 0);
+  $m('musicDecodeLabel').textContent = 'Transcribing';
+  $m('musicDecodeStatus').textContent = 'Idle';
+  musicSetButtons();
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  $m('musicDrop').addEventListener('click', () => $m('musicFile').click());
+  $m('musicDrop').addEventListener('dragover', e => { e.preventDefault(); $m('musicDrop').classList.add('drag'); });
+  $m('musicDrop').addEventListener('dragleave', e => $m('musicDrop').classList.remove('drag'));
+  $m('musicDrop').addEventListener('drop', e => {
+    e.preventDefault(); $m('musicDrop').classList.remove('drag');
+    if (e.dataTransfer.files.length) { musicResetForFile(e.dataTransfer.files[0]); }
+  });
+  $m('musicFile').addEventListener('change', () => {
+    if ($m('musicFile').files.length) { musicResetForFile($m('musicFile').files[0]); }
+  });
+  // bind upload + transcribe buttons
+  $m('musicUploadBtn').addEventListener('click', () => musicUploadHandler());
+  $m('musicTranscribeBtn').addEventListener('click', () => musicTranscribeHandler());
+});
+
+// step 1: upload (bound inside DOMContentLoaded below)
+async function musicUploadHandler() {
+  if (!musicFile || musicBusy) return;
+  musicBusy = true; musicSetButtons();
+  musicSetProgress('musicUploadBar', 0);
+  $m('musicUploadStatus').textContent = 'Uploading…';
+  const fd = new FormData(); fd.append('file', musicFile);
+  const startedAt = performance.now();
+  try {
+    const uploaded = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/v1/audio/music/upload');
+      xhr.upload.onprogress = ev => {
+        if (!ev.lengthComputable) return;
+        const pct = 100 * ev.loaded / ev.total;
+        musicSetProgress('musicUploadBar', pct);
+        $m('musicUploadStatus').textContent = 'Uploading ' + Math.round(pct) + '%';
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(JSON.parse(xhr.responseText));
+        } else {
+          reject(new Error('Upload failed (HTTP ' + xhr.status + ')'));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Upload network error'));
+      xhr.send(fd);
+    });
+    musicUploadedId = uploaded.upload_id;
+    musicSetProgress('musicUploadBar', 100);
+    const elapsed = ((performance.now() - startedAt) / 1000).toFixed(2);
+    $m('musicUploadLabel').textContent = 'Upload';
+    $m('musicUploadStatus').textContent = 'Uploaded in ' + elapsed + ' s';
+  } catch (e) {
+    musicSetProgress('musicUploadBar', 0);
+    $m('musicUploadStatus').textContent = 'Upload failed: ' + e.message;
+  }
+  musicBusy = false; musicSetButtons();
+}
+
+// step 2: transcribe
+async function musicTranscribeHandler() {
+  if (!musicUploadedId || musicBusy) return;
+  musicBusy = true; musicSetButtons();
+  musicSetProgress('musicDecodeBar', 0);
+  $m('musicDecodeLabel').textContent = 'Transcribing';
+  const status = $m('musicStatus');
+  status.textContent = 'Transcribing…';
+  status.className = 'status info';
+  status.style.display = 'block';
+  // indeterminate progress bar + elapsed time ticker (server takes ~3s)
+  const decodeStart = performance.now();
+  const decodeTicker = setInterval(() => {
+    const elapsed = ((performance.now() - decodeStart) / 1000).toFixed(1);
+    $m('musicDecodeStatus').textContent = 'Transcribing… ' + elapsed + ' s';
+    // simulate progress: 5% per second, capped at 90%
+    const pct = Math.min(90, 5 * parseFloat(elapsed));
+    musicSetProgress('musicDecodeBar', pct);
+  }, 200);
+  const startedAt = performance.now();
+  const form = new FormData();
+  form.append('upload_id', musicUploadedId);
+  try {
+    const r = await fetch('/v1/audio/music/transcriptions', { method: 'POST', body: form });
+    if (!r.ok) { const e = await r.json(); throw new Error(e.detail || r.statusText); }
+    const d = await r.json();
+    clearInterval(decodeTicker);
+    musicSetProgress('musicDecodeBar', 100);
+    const wall = ((performance.now() - startedAt) / 1000).toFixed(2);
+    $m('musicDecodeLabel').textContent = 'Transcribed';
+    $m('musicDecodeStatus').textContent = 'Done in ' + wall + ' s';
+    status.textContent = '✓ ' + d.num_events + ' events, ' + d.abc_measures + ' measures';
+    status.className = 'status ok';
+    // timing
+    const p = d.processing || {};
+    $m('musicTiming').style.display = 'block';
+    $m('tWall').textContent = (p.wall_time_seconds || 0) + ' s';
+    $m('tAudio').textContent = (p.audio_duration_seconds || 0) + ' s';
+    $m('tRtf').textContent = p.rtf || '—';
+    $m('tTokens').textContent = p.num_tokens || 0;
+    $m('tWindows').textContent = p.num_windows || 1;
+    $m('tEvents').textContent = d.num_events || 0;
+    // score
+    const session = d.session || (d.output_dir || '').split('/').pop();
+    if (d.svg_pages && d.svg_pages.length) {
+      svgPages = d.svg_pages; finishScoreSetup();
+    } else if (session && d.pages_list_url) {
+      // lazy render: fetch the page list in the background; ABC/MIDI/lyrics
+      // are already usable while the (multi-second) render runs
+      $m('scoreCard').style.display = 'block';
+      $m('pageLabel').textContent = 'Rendering score…';
+      fetch(d.pages_list_url).then(r => r.ok ? r.json() : null).then(p => {
+        svgPages = (p && p.svg_pages) || [];
+        if (svgPages.length) finishScoreSetup();
+        else $m('pageLabel').textContent = 'Score unavailable';
+      }).catch(() => { $m('pageLabel').textContent = 'Score unavailable'; });
+    }
+    if (d.abc) { $m('abcView').style.display = 'block'; $m('abcText').textContent = d.abc; }
+    // score-following player on the uploaded original audio
+    if (d.audio_url) musicSetPlayer(session, d.audio_url);
+    buildDownloads(d);
+    // lyrics lane (demucs + ASR on the vocal stem) — out-of-band, not
+    // counted in transcribe time
+    if (d.session) startLyrics(d.session);
+  } catch (e) {
+    clearInterval(decodeTicker);
+    musicSetProgress('musicDecodeBar', 0);
+    $m('musicDecodeStatus').textContent = 'Failed';
+    status.textContent = 'Error: ' + e.message;
+    status.className = 'status err';
+  }
+  musicBusy = false; musicSetButtons();
+}
+
+// ── score display (inline SVG so note elements can be highlighted) ──
+const pageCache = new Map();
+let curSvg = null, pageToken = 0, activeEls = [];
+
+async function showPage(i, ev) {
+  if (ev) {
+    ev.preventDefault();
+    if (ev.target && ev.target.blur) ev.target.blur();
+  }
+  const winY = window.scrollY;
+  curPage = i;
+  const viewer = $m('scoreViewer');
+  const scrollTop = viewer.scrollTop;
+  $m('pageLabel').textContent = 'Page ' + (i + 1) + ' / ' + svgPages.length;
+  $m('prevBtn').disabled = i <= 0;
+  $m('nextBtn').disabled = i >= svgPages.length - 1;
+  const pg = svgPages[i];
+  if (!pg) return;
+  const token = ++pageToken;
+  let svgText = pageCache.get(pg.url);
+  if (svgText === undefined) {
+    try {
+      const r = await fetch(pg.url);
+      svgText = r.ok ? await r.text() : '';
+      pageCache.set(pg.url, svgText);
+    } catch (e) { return; }
+  }
+  if (token !== pageToken) return;
+  viewer.innerHTML = svgText +
+    '<div id="noteMarker"></div>';
+  viewer.scrollTop = scrollTop;
+  curSvg = viewer.querySelector('svg');
+  window.scrollTo(0, winY);
+  applyHighlights();
+}
+function prevPage(ev) { if (curPage > 0) showPage(curPage - 1, ev); }
+function nextPage(ev) { if (curPage < svgPages.length - 1) showPage(curPage + 1, ev); }
+
+// ── downloads: piano mix row with expandable vocal/instrumental rows ──
+function buildDownloads(d) {
+  const piano = d.piano_wavs || {};
+  const audio = u => u ? '<audio controls preload="none" src="' + u + '"' +
+    ' style="height:28px;max-width:190px"></audio>' : '';
+  const dl = u => u ? '<a href="' + u + '" download>&#8595;</a>' : '';
+  $m('pianoRow').innerHTML =
+    '<span class="dl-label">&#127929; Piano Mix</span>' + audio(piano.mix) + dl(piano.mix) +
+    '<button type="button" id="pianoExpand" title="Show vocal / instrumental">&#9662;</button>';
+  $m('pianoVocalRow').innerHTML =
+    '<span class="dl-label sub">&#127929; Piano Vocal</span>' + audio(piano.vocal) + dl(piano.vocal);
+  $m('pianoInsRow').innerHTML =
+    '<span class="dl-label sub">&#127929; Piano Instrumental</span>' + audio(piano.instrumental) + dl(piano.instrumental);
+  $m('pianoExtra').style.display = 'none';
+  $m('pianoExpand').innerHTML = '&#9662;';
+  $m('pianoExpand').onclick = () => {
+    const x = $m('pianoExtra');
+    const open = x.style.display === 'block';
+    x.style.display = open ? 'none' : 'block';
+    $m('pianoExpand').innerHTML = open ? '&#9662;' : '&#9652;';
+  };
+  let midi = '';
+  for (const [k, v] of Object.entries(d.midi_files || {}))
+    midi += '<a href="' + v + '">MIDI ' + k + '</a>';
+  if (d.session)
+    midi += '<a href="/v1/audio/music/score/' + d.session + '/score.abc" download="score.abc">ABC</a>';
+  $m('midiRow').innerHTML = midi;
+}
+
+// ── lyrics lane (background: demucs separation + ASR on the vocal stem) ──
+let lyricsTimer = null;
+function startLyrics(session) {
+  clearInterval(lyricsTimer);
+  $m('lyricsCard').style.display = 'block';
+  $m('lyricsStatus').textContent = 'Separating vocals (demucs)…';
+  $m('lyricsStatus').className = 'status info';
+  $m('lyricsText').textContent = '';
+  const form = new FormData(); form.append('session', session);
+  fetch('/v1/audio/music/lyrics', { method: 'POST', body: form })
+    .then(r => r.json())
+    .then(() => {
+      lyricsTimer = setInterval(async () => {
+        try {
+          const s = await (await fetch('/v1/audio/music/lyrics/' + session)).json();
+          if (s.status === 'done') {
+            clearInterval(lyricsTimer);
+            $m('lyricsStatus').className = 'status ok';
+            $m('lyricsStatus').textContent = '&#10003; Lyrics — separation ' +
+              s.separation_seconds + ' s + ASR ' + s.asr_seconds +
+              ' s (background, not in transcribe time)';
+            $m('lyricsStatus').innerHTML = $m('lyricsStatus').textContent;
+            $m('lyricsText').textContent = s.lyrics || '(empty)';
+          } else if (s.status === 'error') {
+            clearInterval(lyricsTimer);
+            $m('lyricsStatus').className = 'status err';
+            $m('lyricsStatus').textContent = 'Lyrics failed: ' + s.error;
+          } else if (s.status === 'transcribing') {
+            $m('lyricsStatus').textContent = 'Transcribing lyrics (ASR on vocal stem)…';
+          } else if (s.status === 'separating') {
+            $m('lyricsStatus').textContent = 'Separating vocals (demucs)…';
+          }
+        } catch (e) { /* keep polling */ }
+      }, 2500);
+    })
+    .catch(e => {
+      $m('lyricsStatus').className = 'status err';
+      $m('lyricsStatus').textContent = 'Lyrics lane failed to start: ' + e;
+    });
+}
+
+// ── score-following playback ──
+// Notes are matched between playback.json (seconds) and the rendered SVG
+// via (measure, ordinal): a note starting within EPS of a barline belongs
+// to the measure written AFTER the barline, matching the notation.
+let playbackData = null, pageInfo = null, notesByMeasure = null;
+const EPS_MEASURE = 0.02;
+let musicSession = null;
+
+function musicSetPlayer(session, audioUrl) {
+  musicSession = session;
+  playbackData = pageInfo = notesByMeasure = null;
+  activeEls = [];
+  const audio = $m('songAudio');
+  audio.src = audioUrl;
+  $m('songPlayer').style.display = 'flex';
+  $m('songPlayBtn').innerHTML = '&#9654;';
+  fetch('/v1/audio/music/score/' + session + '/playback.json')
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      playbackData = d;
+      notesByMeasure = buildNotesByMeasure(d);
+      applyHighlights();
+    });
+}
+
+// called once the (lazily rendered) score pages are available
+function finishScoreSetup() {
+  curPage = 0;
+  $m('scoreNav').style.display = 'flex';
+  showPage(0);
+  const session = musicSession;
+  if (session) {
+    fetch('/v1/audio/music/score/' + session + '/score_pages.json')
+      .then(r => r.ok ? r.json() : null).then(d => { pageInfo = d; });
+  }
+}
+
+function buildNotesByMeasure(pb) {
+  const map = {};
+  if (!pb || !pb.measures || !pb.measures.length) return map;
+  const starts = pb.measures.map(m => m.start);
+  for (const track of pb.tracks || []) {
+    if (track.name === 'Chords') continue;
+    const per = [];
+    (track.notes || []).forEach((n, j) => {
+      let m = 0, lo = 0, hi = starts.length - 1;
+      while (lo <= hi) { const mid = (lo + hi) >> 1; if (starts[mid] <= n.start + EPS_MEASURE) { m = mid; lo = mid + 1; } else hi = mid - 1; }
+      (per[m] = per[m] || []).push(j);
+    });
+    map[track.name] = per;
+  }
+  return map;
+}
+
+function syncScore() {
+  if (!playbackData) return;
+  const measures = playbackData.measures || [];
+  if (!measures.length) return;
+  const t = $m('songAudio').currentTime;
+  let lo = 0, hi = measures.length - 1, m = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (measures[mid].start <= t) { m = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  $m('measureLabel').textContent = 'Measure ' + (m + 1) + ' / ' + measures.length;
+  if (pageInfo && pageInfo.length) {
+    for (let i = 0; i < pageInfo.length; i++) {
+      const range = pageInfo[i].measures;
+      if (range && m >= range[0] && m <= range[1]) {
+        // while playing, timeupdate (~4 Hz) keeps the page following;
+        // while paused this only fires on seeked, so manual browsing sticks
+        if (i !== curPage) showPage(i);
+        break;
+      }
+    }
+  }
+  applyHighlights();
+}
+
+function applyHighlights() {
+  for (const el of activeEls) el.removeAttribute('data-on');
+  activeEls = [];
+  const marker = $m('noteMarker');
+  if (!curSvg || !playbackData || !notesByMeasure) {
+    if (marker) marker.style.display = 'none';
+    return;
+  }
+  const t = $m('songAudio').currentTime;
+  const measures = playbackData.measures || [];
+  let m = 0, lo = 0, hi = measures.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (measures[mid].start <= t) { m = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  for (const track of playbackData.tracks || []) {
+    if (track.name === 'Chords') continue;
+    const per = notesByMeasure[track.name];
+    if (!per || !per[m]) continue;
+    const notes = track.notes || [];
+    per[m].forEach((j, k) => {
+      if (notes[j].start > t + EPS_MEASURE || notes[j].end <= t) return;
+      const els = curSvg.querySelectorAll(
+        '[data-voice="' + track.name + '"][data-m="' + m + '"][data-ni="' + k + '"]');
+      for (const el of els) { el.setAttribute('data-on', '1'); activeEls.push(el); }
+    });
+  }
+  // guide marker: a red arrow just left of the first active note
+  if (!marker) return;
+  if (!activeEls.length) { marker.style.display = 'none'; return; }
+  const el = activeEls[0];
+  const nr = el.getBoundingClientRect();
+  const vr = $m('scoreViewer').getBoundingClientRect();
+  if (!nr.width && !nr.height) { marker.style.display = 'none'; return; }
+  marker.style.display = 'block';
+  marker.style.left = Math.max(2, nr.left - vr.left +
+    $m('scoreViewer').scrollLeft - 15) + 'px';
+  marker.style.top = (nr.top - vr.top + $m('scoreViewer').scrollTop +
+    nr.height / 2 - 7) + 'px';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const audio = $m('songAudio');
+  if (!audio || audio._syncBound) return;
+  audio._syncBound = true;
+  $m('songPlayBtn').onclick = () => { if (audio.paused) audio.play(); else audio.pause(); };
+  audio.addEventListener('timeupdate', syncScore);
+  audio.addEventListener('seeked', syncScore);
+  audio.addEventListener('play', () => { $m('songPlayBtn').innerHTML = '&#10074;&#10074;'; });
+  audio.addEventListener('pause', () => { $m('songPlayBtn').innerHTML = '&#9654;'; });
+  audio.addEventListener('ended', () => { $m('songPlayBtn').innerHTML = '&#9654;'; });
+});
+
+const fileInput = document.querySelector('#file');
+const drop = document.querySelector('#drop');
+const poolSel = document.querySelector('#pool');
+const rescoreChk = document.querySelector('#rescore');
+const uploadBtn = document.querySelector('#uploadBtn');
+const transcribeBtn = document.querySelector('#transcribeBtn');
+const webrtcBtn = document.querySelector('#webrtcBtn');
+const out = document.querySelector('#out');
+const uploadBar = document.querySelector('#uploadBar');
+const asrBar = document.querySelector('#asrBar');
+const uploadLabel = document.querySelector('#uploadLabel');
+const asrLabel = document.querySelector('#asrLabel');
+const uploadStatus = document.querySelector('#uploadStatus');
+const asrStatus = document.querySelector('#asrStatus');
+let selectedFile = null;
+let uploadedId = null;
+let audioDuration = 0;
+let busy = false;
+let ws = null;
+
+function logState(message) {
+  console.log(`[VeloxVoice] ${message}`);
+}
+
+function seconds(value) {
+  return `${Number(value).toFixed(2)} s`;
+}
+
+function setProgress(bar, percent) {
+  const value = Math.max(0, Math.min(100, Number(percent) || 0));
+  bar.style.width = `${value}%`;
+}
+
+function setButtons() {
+  uploadBtn.disabled = busy || !selectedFile;
+  transcribeBtn.disabled = busy || !uploadedId;
+  webrtcBtn.disabled = busy || !selectedFile;
+}
+
+function resetForFile(file) {
+  selectedFile = file;
+  uploadedId = null;
+  audioDuration = 0;
+  out.textContent = file ? 'Audio selected. Choose Upload or live WebRTC transcription.' : 'Waiting for audio…';
+  setProgress(uploadBar, 0);
+  uploadLabel.textContent = 'Upload';
+  uploadStatus.textContent = file ? 'Selected' : 'Idle';
+  setProgress(asrBar, 0);
+  asrLabel.textContent = 'Transcribing';
+  asrStatus.textContent = 'Idle';
+  setButtons();
+}
+
+function loadDuration(file) {
+  const media = document.createElement('audio');
+  const url = URL.createObjectURL(file);
+  media.preload = 'metadata';
+  media.onloadedmetadata = () => {
+    audioDuration = Number.isFinite(media.duration) ? media.duration : 0;
+    URL.revokeObjectURL(url);
+    logState(`Audio duration detected: ${seconds(audioDuration)}`);
+  };
+  media.onerror = () => {
+    URL.revokeObjectURL(url);
+    logState('Audio duration detection failed; live progress will use received audio seconds');
+  };
+  media.src = url;
+}
+
+function appendTranscript(text) {
+  if (!text) return;
+  if (out.textContent.startsWith('Waiting for audio') || out.textContent.startsWith('Audio selected')) {
+    out.textContent = '';
+  }
+  out.appendChild(document.createTextNode(text));
+  out.appendChild(document.createElement('br'));
+}
+
+function markTranscribed(wallSeconds, audioSeconds, processingSeconds, rtf) {
+  setProgress(asrBar, 100);
+  asrLabel.textContent = 'Transcribed';
+  const processing = processingSeconds !== undefined
+    ? `Server ${seconds(processingSeconds)}`
+    : null;
+  const rtfText = (rtf !== undefined && Number.isFinite(Number(rtf)))
+    ? `RTF ${Number(rtf).toFixed(5)}`
+    : null;
+  asrStatus.textContent = `Completed in ${seconds(wallSeconds)}`;
+  if (audioSeconds !== undefined) {
+    asrStatus.textContent += ` / Audio ${seconds(audioSeconds)}`;
+  }
+  if (processing) {
+    asrStatus.textContent += ` / ${processing}`;
+  }
+  if (rtfText) {
+    asrStatus.textContent += ` / ${rtfText}`;
+  }
+  logState(`Transcription complete: wall=${seconds(wallSeconds)}, audio=${seconds(audioSeconds || 0)}${processing ? `, server=${processing}` : ''}${rtfText ? `, ${rtfText}` : ''}`);
+}
+
+fileInput.onchange = () => {
+  const file = fileInput.files[0];
+  resetForFile(file);
+  if (file) {
+    loadDuration(file);
+    logState(`Audio selected: ${file.name} (${file.size} bytes)`);
+  } else {
+    logState('Audio selection cleared');
+  }
+};
+
+drop.onclick = () => fileInput.click();
+drop.ondragover = ev => {
+  ev.preventDefault();
+  drop.classList.add('drag');
+};
+drop.ondragleave = () => drop.classList.remove('drag');
+drop.ondrop = ev => {
+  ev.preventDefault();
+  drop.classList.remove('drag');
+  const file = ev.dataTransfer.files[0];
+  resetForFile(file);
+  if (file) {
+    loadDuration(file);
+    logState(`Audio selected: ${file.name} (${file.size} bytes)`);
+  }
+};
+
+function inputFormat(file) {
+  const type = (file.type || '').toLowerCase();
+  const name = (file.name || '').toLowerCase();
+  if (type === 'audio/mpeg' || name.endsWith('.mp3')) return 'mp3';
+  if (type === 'audio/wav' || type === 'audio/x-wav' || name.endsWith('.wav')) return 'wav';
+  if (type === 'audio/flac' || name.endsWith('.flac')) return 'flac';
+  if (type === 'audio/ogg' || name.endsWith('.ogg') || name.endsWith('.opus')) return 'ogg';
+  return 'auto';
+}
+
+function uploadWithProgress() {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append('file', selectedFile);
+    const xhr = new XMLHttpRequest();
+    const startedAt = performance.now();
+    xhr.open('POST', '/v1/audio/uploads');
+    xhr.responseType = 'json';
+    xhr.upload.onprogress = ev => {
+      if (!ev.lengthComputable) return;
+      const percent = 100 * ev.loaded / ev.total;
+      setProgress(uploadBar, percent);
+      uploadStatus.textContent = `Uploading ${Math.round(percent)}%`;
+      logState(`Upload progress: ${Math.round(percent)}%`);
+    };
+    xhr.onload = () => {
+      const elapsed = (performance.now() - startedAt) / 1000;
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
+        setProgress(uploadBar, 100);
+        uploadLabel.textContent = 'Upload';
+        uploadStatus.textContent = `Uploaded in ${seconds(elapsed)}`;
+        logState(`Upload complete in ${seconds(elapsed)}: id=${xhr.response.id}, path=${xhr.response.audio_path}`);
+        resolve(xhr.response);
+      } else {
+        reject(new Error(xhr.response && xhr.response.detail ? xhr.response.detail : `Upload failed (HTTP ${xhr.status})`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Upload network error'));
+    xhr.send(form);
+  });
+}
+
+uploadBtn.onclick = async () => {
+  if (!selectedFile || busy) return;
+  busy = true;
+  setButtons();
+  logState('Upload started');
+  try {
+    const result = await uploadWithProgress();
+    uploadedId = result.id;
+  } catch (err) {
+    setProgress(uploadBar, 0);
+    uploadStatus.textContent = 'Upload failed';
+    console.error(`[VeloxVoice] Upload error: ${err.message}`);
+    alert(err.message);
+  } finally {
+    busy = false;
+    setButtons();
+  }
+};
+
+async function readSse(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop();
+    for (const event of events) {
+      const dataLine = event.split(/\r?\n/).find(line => line.startsWith('data:'));
+      if (dataLine) await onEvent(dataLine.slice(5).trim());
+    }
+  }
+}
+
+transcribeBtn.onclick = async () => {
+  if (!uploadedId || busy) return;
+  busy = true;
+  setButtons();
+  out.textContent = '';
+  setProgress(asrBar, 0);
+  asrLabel.textContent = 'Transcribing';
+  asrStatus.textContent = 'Starting';
+  logState('Post-upload transcription started');
+  const startedAt = performance.now();
+  const form = new FormData();
+  form.append('audio_id', uploadedId);
+  form.append('response_format', 'json');
+  form.append('stream', 'true');
+  form.append('rescore', rescoreChk.checked ? 'true' : 'false');
+  try {
+    const response = await fetch('/v1/audio/transcriptions', { method: 'POST', body: form });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null);
+      throw new Error(detail && detail.detail ? detail.detail : `Transcription failed (HTTP ${response.status})`);
+    }
+    await readSse(response, async data => {
+      if (data === '[DONE]') return;
+      const obj = JSON.parse(data);
+      if (obj.type === 'transcript.text.delta') {
+        appendTranscript(obj.delta);
+        const percent = obj.progress !== undefined ? obj.progress * 100 : 0;
+        setProgress(asrBar, percent);
+        asrStatus.textContent = `Transcribing ${Math.round(percent)}%`;
+        logState(`Transcription progress: ${Math.round(percent)}%`);
+      } else if (obj.type === 'transcript.text.done') {
+        out.textContent = obj.text;
+        markTranscribed(
+          (performance.now() - startedAt) / 1000,
+          obj.audio_seconds,
+          obj.elapsed_seconds,
+          obj.rtf,
+        );
+      } else if (obj.type === 'error') {
+        throw new Error(obj.error && obj.error.message ? obj.error.message : 'Transcription failed');
+      }
+    });
+  } catch (err) {
+    setProgress(asrBar, 0);
+    asrLabel.textContent = 'Transcribing';
+    asrStatus.textContent = 'Failed';
+    out.textContent = `Error: ${err.message}`;
+    console.error(`[VeloxVoice] Transcription error: ${err.message}`);
+  } finally {
+    busy = false;
+    setButtons();
+  }
+};
+
+webrtcBtn.onclick = async () => {
+  if (!selectedFile || busy) return;
+  busy = true;
+  setButtons();
+  out.textContent = '';
+  setProgress(uploadBar, 0);
+  uploadLabel.textContent = 'Upload';
+  uploadStatus.textContent = 'Connecting';
+  setProgress(asrBar, 0);
+  asrLabel.textContent = 'Transcribing';
+  asrStatus.textContent = 'Starting';
+  const liveStart = performance.now();
+  let uploadStart = performance.now();
+  logState('Live WebRTC transcription started');
+  const wsUrl = `${location.origin.replace(/^http/, 'ws')}/v1/audio/ws`;
+  ws = new WebSocket(wsUrl);
+  try {
+    await new Promise((resolve, reject) => {
+      ws.onopen = () => {
+        logState('Live streaming connection opened');
+        uploadStart = performance.now();
+        uploadStatus.textContent = 'Uploading';
+        ws.send(JSON.stringify({
+          type: 'start',
+          pool_seconds: Number(poolSel.value),
+          format: inputFormat(selectedFile),
+          filename: selectedFile.name,
+          rescore: rescoreChk.checked,
+        }));
+        resolve();
+      };
+      ws.onerror = () => {
+        uploadStatus.textContent = 'Failed';
+        asrStatus.textContent = 'Failed';
+        console.error('[VeloxVoice] Live streaming connection error');
+        reject(new Error('Live streaming connection failed'));
+      };
+    });
+  } catch (err) {
+    busy = false;
+    setButtons();
+    return;
+  }
+
+  ws.onmessage = ev => {
+    const obj = JSON.parse(ev.data);
+    if (obj.type === 'partial') {
+      appendTranscript(obj.text);
+      if (audioDuration > 0) {
+        const percent = 100 * obj.audio_seconds / audioDuration;
+        setProgress(asrBar, percent);
+        asrStatus.textContent = `Transcribing ${Math.round(percent)}%`;
+        logState(`Live transcription progress: ${Math.round(percent)}%`);
+      } else {
+        asrStatus.textContent = `Transcribed ${seconds(obj.audio_seconds)}`;
+        logState(`Live transcription progress: ${seconds(obj.audio_seconds)} received`);
+      }
+    } else if (obj.type === 'final') {
+      out.textContent = obj.text;
+      markTranscribed(
+        (performance.now() - liveStart) / 1000,
+        obj.audio_seconds,
+        obj.elapsed_seconds,
+        obj.rtf,
+      );
+    } else if (obj.type === 'error') {
+      out.textContent = `Error: ${obj.detail}`;
+      setProgress(asrBar, 0);
+      asrLabel.textContent = 'Transcribing';
+      asrStatus.textContent = 'Failed';
+      console.error(`[VeloxVoice] Live transcription error: ${obj.detail}`);
+    }
+  };
+  ws.onclose = () => {
+    logState('Live streaming connection closed');
+    busy = false;
+    setButtons();
+  };
+  ws.onerror = () => {
+    uploadStatus.textContent = 'Failed';
+    asrStatus.textContent = 'Failed';
+    console.error('[VeloxVoice] Live streaming connection error');
+  };
+
+  const chunkSize = 1024 * 1024 * 4;
+  let offset = 0;
+  try {
+    while (offset < selectedFile.size && ws.readyState === 1) {
+      const buf = await selectedFile.slice(offset, offset + chunkSize).arrayBuffer();
+      ws.send(buf);
+      offset += buf.byteLength;
+      const percent = 100 * offset / selectedFile.size;
+      setProgress(uploadBar, percent);
+      uploadStatus.textContent = `Uploading ${Math.round(percent)}%`;
+      logState(`Live upload progress: ${Math.round(percent)}%`);
+    }
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'stop' }));
+      setProgress(uploadBar, 100);
+      uploadStatus.textContent = `Uploaded in ${seconds((performance.now() - uploadStart) / 1000)}`;
+      logState(`Live upload complete in ${seconds((performance.now() - uploadStart) / 1000)}; waiting for final transcription`);
+    }
+  } catch (err) {
+    console.error(`[VeloxVoice] Live upload error: ${err.message}`);
+  }
+};
+</script>
+
+  </div><!-- end asrPanel -->
+
+  <div id="musicPanel" style="display:none">
+    <div class="card">
+      <div class="drop" id="musicDrop">
+        <b>Select song</b><br>
+        <small>MP3, WAV, FLAC, OGG — Vocal + Instrumental melody transcription</small>
+      </div>
+      <input type="file" id="musicFile" accept=".mp3,.wav,.flac,.ogg,.m4a" />
+      <div class="actions">
+        <button id="musicUploadBtn" disabled>Upload</button>
+        <button id="musicTranscribeBtn" disabled>Transcribe (after uploading)</button>
+      </div>
+
+      <div class="progress"><div id="musicUploadBar"></div></div>
+      <div class="progress-label"><span id="musicUploadLabel">Upload</span><span id="musicUploadStatus">Idle</span></div>
+
+      <div class="progress"><div id="musicDecodeBar"></div></div>
+      <div class="progress-label"><span id="musicDecodeLabel">Transcribing</span><span id="musicDecodeStatus">Idle</span></div>
+
+      <div class="status" id="musicStatus" style="display:none"></div>
+      <div class="timing" id="musicTiming" style="display:none">
+        <table>
+          <tr><td>Wall time</td><td id="tWall">&mdash;</td></tr>
+          <tr><td>Audio duration</td><td id="tAudio">&mdash;</td></tr>
+          <tr><td>RTF</td><td id="tRtf">&mdash;</td></tr>
+          <tr><td>Tokens generated</td><td id="tTokens">&mdash;</td></tr>
+          <tr><td>Windows processed</td><td id="tWindows">&mdash;</td></tr>
+          <tr><td>Events detected</td><td id="tEvents">&mdash;</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="card" id="scoreCard" style="display:none">
+      <h3 style="font-size:16px;margin-bottom:8px">&#127925; Lead Sheet &mdash; Vocal + Instrumental</h3>
+      <div id="songPlayer" style="display:none;align-items:center;gap:10px;margin-top:8px">
+        <button type="button" id="songPlayBtn" style="width:40px;height:40px;border-radius:50%;border:none;background:#10a37f;color:#fff;font-size:16px;cursor:pointer;flex:none">&#9654;</button>
+        <audio id="songAudio" controls style="flex:1;height:36px"></audio>
+        <span id="measureLabel" style="font-size:13px;color:#666;flex:none;min-width:110px;text-align:right"></span>
+      </div>
+      <div class="score-viewer" id="scoreViewer"></div>
+      <div class="score-nav" id="scoreNav" style="display:none">
+        <button type="button" onclick="prevPage(event)" id="prevBtn">&larr; Prev</button>
+        <span id="pageLabel">Page 1 / N</span>
+        <button type="button" onclick="nextPage(event)" id="nextBtn">Next &rarr;</button>
+      </div>
+      <div class="abc-view" id="abcView" style="display:none">
+        <details><summary style="cursor:pointer;color:#10a37f">ABC notation</summary>
+          <pre id="abcText"></pre></details>
+      </div>
+      <div class="dl" id="pianoRow" style="margin-top:10px"></div>
+      <div id="pianoExtra" style="display:none;margin-top:4px">
+        <div class="dl" id="pianoVocalRow"></div>
+        <div class="dl" id="pianoInsRow"></div>
+      </div>
+      <div class="dl" id="midiRow" style="margin-top:6px"></div>
+    </div>
+    <div class="card" id="lyricsCard" style="display:none">
+      <h3 style="font-size:16px;margin-bottom:8px">&#127769; Lyrics <span style="font-size:12px;color:#888;font-weight:normal">(ASR on separated vocal stem &mdash; best effort)</span></h3>
+      <div class="status info" id="lyricsStatus" style="display:block"></div>
+      <pre id="lyricsText" style="margin-top:8px;background:#f8f8f8;border:1px solid #ddd;border-radius:6px;padding:10px;font-size:13px;line-height:1.6;white-space:pre-wrap;max-height:260px;overflow:auto"></pre>
+    </div>
+  </div>
+
+  <style>
+    #musicPanel .drop { border: 2px dashed #bbb; border-radius: 10px; padding: 22px;
+      text-align: center; cursor: pointer; }
+    #musicPanel .drop.drag { border-color: #10a37f; background: #e8f7f2; }
+    #musicPanel .status { margin-top: 8px; padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+    #musicPanel .status.info { color: #10a37f; }
+    #musicPanel .status.ok { color: #059669; }
+    #musicPanel .status.err { color: #dc2626; }
+    #musicPanel .timing { margin-top: 8px; font-size: 13px; color: #555; }
+    #musicPanel .timing td { padding: 2px 10px; }
+    #musicPanel .score-viewer { margin-top: 12px; text-align: center;
+      position: relative; overflow-anchor: none;
+      border: 1px solid #ddd; border-radius: 8px; overflow: auto;
+      height: 70vh; background: #fff; }
+    #musicPanel .score-viewer svg { width: 100%; height: auto; display: block; }
+    #musicPanel .score-viewer svg [data-on="1"],
+    #musicPanel .score-viewer svg [data-on="1"] * {
+      fill: #dc2626 !important; stroke: #dc2626 !important; }
+    #musicPanel #noteMarker { position: absolute; width: 0; height: 0;
+      border-top: 7px solid transparent; border-bottom: 7px solid transparent;
+      border-left: 11px solid #dc2626; filter: drop-shadow(0 0 3px #dc2626);
+      display: none; pointer-events: none; z-index: 5;
+      transition: left 70ms linear, top 70ms linear; }
+    #musicPanel .score-nav { display: flex; justify-content: center; align-items: center;
+      gap: 12px; margin-top: 10px; }
+    #musicPanel .score-nav button { background: #f0f0f0; color: #333; border: 1px solid #ccc;
+      padding: 6px 14px; border-radius: 6px; cursor: pointer; }
+    #musicPanel .score-nav button:disabled { opacity: .3; }
+    #musicPanel .score-nav span { font-size: 14px; color: #666; }
+    #musicPanel .dl { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    #musicPanel .dl a { color: #10a37f; text-decoration: none; font-size: 13px;
+      padding: 4px 10px; border: 1px solid #ddd; border-radius: 4px; }
+    #musicPanel .dl a:hover { background: #e8f7f2; }
+    #musicPanel .dl-label { font-size: 12px; color: #666; min-width: 130px; }
+    #musicPanel .dl-label.sub { margin-left: 18px; min-width: 112px; }
+    #musicPanel #pianoExpand { background: #f0f0f0; color: #333; border: 1px solid #ccc;
+      padding: 2px 10px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    #musicPanel .abc-view { margin-top: 10px; background: #f8f8f8; border: 1px solid #ddd;
+      border-radius: 6px; padding: 10px; font-family: monospace; font-size: 12px;
+      color: #555; max-height: 200px; overflow: auto; white-space: pre; }
+  </style>
+
+</body>
+</html>

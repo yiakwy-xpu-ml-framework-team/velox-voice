@@ -16,12 +16,14 @@ Routes
 from __future__ import annotations
 
 import argparse
+import os
 import asyncio
 import json
 import math
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -31,6 +33,7 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
@@ -461,6 +464,16 @@ class _AudioStreamSession:
 
 
 # TODO (yiakwy) : move api and test server to different files
+def _music_warmup_by_model(model, device):
+    """Trigger cuDNN/allocator warmup for the music recognition."""
+    import torch as _t
+
+    dummy = _t.zeros(1, int(model.cfg.input_audio_length * 24000), device=device)
+    with _t.inference_mode():
+        model.encode(dummy)
+    _t.cuda.synchronize()
+
+
 def create_app(
     model_dir: str | Path,
     device: str = "cuda",
@@ -468,6 +481,8 @@ def create_app(
     enable_graphs: bool = True,
     pool_seconds: float = 20.0,
     upload_dir: str | Path = UPLOAD_DIR,
+    music_model_dir: str | Path | None = None,
+    base_model_dir: str | Path | None = None,
 ) -> FastAPI:
     app = FastAPI(title="VeloxVoice ASR", version="0.1.0")
     app.state.model_name = Path(model_dir).name
@@ -488,12 +503,40 @@ def create_app(
         enable_graphs=enable_graphs,
     )
     upload_dir = Path(upload_dir)
+    is_music = getattr(vx, "kind", "") == "sheetsage2"
+
+    # music recognition: load SheetSage2 + MERT-v2 in addition to ASR
+    model_music = None
+    if music_model_dir and base_model_dir:
+        from veloxvoice.models.sheetsage.v2 import api as sheetsage_api
+
+        model_music = sheetsage_api.load_model(
+            str(music_model_dir), str(base_model_dir), "bf16", device)
+        print(f"[VeloxVoice] music model loaded: {music_model_dir}")
+    has_music = model_music is not None
+
+    async def _do_music_transcribe(audio_path: str, out_dir: Path):
+        from veloxvoice.models.sheetsage.v2 import api as sheetsage_api
+
+        return await asyncio.to_thread(
+            sheetsage_api.transcribe, model_music, audio_path,
+            output_dir=str(out_dir), serving=True)
 
     @app.on_event("startup")
     async def _startup() -> None:
         await asyncio.to_thread(
             lambda: vx.warmup((0.5, 1.0, 5.0, 10.0, pool_seconds, 30.0))
         )
+        if has_music:
+            # schedule music warmup AFTER server starts accepting connections
+            asyncio.get_event_loop().call_later(
+                1.0,
+                lambda: asyncio.ensure_future(
+                    asyncio.to_thread(
+                        lambda: _music_warmup_by_model(model_music, device)
+                    )
+                )
+            )
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -551,8 +594,11 @@ def create_app(
             }
         )
 
-    @app.post("/v1/audio/transcriptions")
-    async def transcribe_file(
+    _has_asr = hasattr(vx, "warmup")  # VeloxMusic skips Velox.__init__
+
+    if _has_asr:
+      @app.post("/v1/audio/transcriptions")
+      async def transcribe_file(
         file: UploadFile | None = File(default=None),
         audio_id: str | None = Form(default=None),
         model: str | None = Form(default=None),
@@ -798,14 +844,325 @@ def create_app(
     async def root() -> RedirectResponse:
         return RedirectResponse(url="/docs", status_code=307)
 
+    # ── music recognition endpoints ──────────────────────────────────────────────
+    _music_output_dir = Path("/tmp/veloxvoice_music_output")
+    _lyrics_jobs: set[str] = set()
+
+    @app.post("/v1/audio/music/upload")
+    async def music_upload(file: UploadFile = File(...)) -> JSONResponse:
+        """Upload a song for music transcription."""
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, "Uploaded audio file is empty")
+        upload_id = uuid4().hex[:12]
+        music_dir = _music_output_dir / upload_id
+        music_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = music_dir / (file.filename or "song.mp3")
+        audio_path.write_bytes(data)
+        return JSONResponse({
+            "upload_id": upload_id,
+            "filename": file.filename,
+            "audio_path": str(audio_path),
+            "size": len(data),
+        })
+
+    @app.post("/v1/audio/music/transcriptions")
+    async def music_transcribe(upload_id: str = Form(...)):
+        """Music audio to lead sheet (ABC + SVG score + MIDI)."""
+        music_dir = _music_output_dir / upload_id
+        if not music_dir.exists():
+            raise HTTPException(404, f"Upload {upload_id} not found")
+
+        audio_files = [f for f in music_dir.iterdir()
+                       if f.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg", ".m4a")]
+        
+        if not audio_files:
+            raise HTTPException(404, "No audio file in upload")
+
+        audio_path = audio_files[0]
+
+        _t0 = time.monotonic()
+        result = await _do_music_transcribe(str(audio_path), music_dir)
+        _t1 = time.monotonic()
+        print(f"[music-timing] model: {(_t1-_t0)*1000:.0f}ms")
+
+        _t2 = time.monotonic()
+        print(f"[music-timing] response build: {(_t2-_t1)*1000:.0f}ms")
+
+        svg_pages = []
+        for f in sorted(music_dir.glob("score_*.svg")):
+            svg_pages.append({
+                "page": int(f.stem.split("_")[1]),
+                "url": f"/v1/audio/music/score/{music_dir.name}/{f.name}",
+            })
+        
+        abc_text = None
+        abc_file = music_dir / "score.abc"
+        if abc_file.exists():
+            abc_text = abc_file.read_text()
+
+        elapsed = result.get("elapsed_seconds", 0)
+        duration_s = result.get("duration_seconds", 0)
+
+        _base = "/v1/audio/music/score/" + music_dir.name
+
+        # see TEST_API.md
+        return JSONResponse({
+            "abc": abc_text,
+            "abc_measures": result.get("abc_measures", 0),
+            "abc_error": result.get("abc_error"),
+            "svg_pages": svg_pages,
+            "pages_pending": not svg_pages,
+            "pages_list_url": _base + "/pages",
+            "num_events": result.get("num_events", 0),
+            "duration_seconds": duration_s,
+            "output_dir": str(music_dir),
+            "session": music_dir.name,
+            "audio_url": _base + "/" + audio_path.name,
+            "playback_url": _base + "/playback.json" if (music_dir / "playback.json").exists() else None,
+            "pages_url": _base + "/score_pages.json" if (music_dir / "score_pages.json").exists() else None,
+            "midi_files": {
+                "full": _base + "/transcription.mid",
+                "vocal": _base + "/melody_vocal.mid",
+                "instrumental": _base + "/melody_instrumental.mid",
+                "chords": _base + "/chords.mid",
+            },
+            "piano_wav": _base + "/piano/mix",
+            "piano_wavs": {
+                part: _base + "/piano/" + part for part in ("mix", "vocal", "instrumental")
+            },
+            "processing": {
+                "elapsed_seconds": round(elapsed, 3),
+                "audio_duration_seconds": round(duration_s, 3),
+                "rtf": round(elapsed / duration_s, 5) if duration_s > 0 else None,
+                "wall_time_seconds": round(elapsed, 3),
+                "num_tokens": len(result.get("tokens", [])[0]) if result.get("tokens") else 0,
+                "num_windows": len(result.get("tokens", [])),
+            },
+        })
+
+    def _ensure_playback_bundle(music_dir: Path) -> None:
+        """Rebuild the playback MIDI bundle from melody.mid + chord.lab when absent"""
+        if (music_dir / "transcription.mid").exists():
+            return
+        if not (music_dir / "melody.mid").exists():
+            raise HTTPException(404, "No transcription for this session")
+        duration = None
+        result_path = music_dir / "result.json"
+        if result_path.exists():
+            try:
+                duration = json.loads(result_path.read_text(
+                    encoding="utf-8")).get("duration_seconds")
+            except Exception:
+                duration = None
+        from veloxvoice.audio.music_midi import export_playback
+
+        export_playback(music_dir, None, duration)
+
+    @app.get("/v1/audio/music/score/{session}/pages")
+    async def music_score_pages(session: str):
+        """Render all score pages on first call; return the page list JSON.
+
+        Laziness keeps transcribe fast: the (multi-second) playwright render
+        happens in the background while the client already shows ABC/MIDI.
+        """
+        music_dir = _music_output_dir / session
+        if not music_dir.exists():
+            raise HTTPException(404, f"Session {session} not found")
+
+        def _render():
+            from veloxvoice.audio.music_rendering import render_outputs
+
+            render_assets = Path(__file__).resolve().parents[2] / "render_assets"
+            render_outputs(input_dir=music_dir, output_dir=music_dir,
+                           score="svg", audio=False,
+                           assets_dir=str(render_assets) if render_assets.exists() else None)
+        
+        if not list(music_dir.glob("score_*.svg")):
+            await asyncio.to_thread(_render)
+
+        pages = []
+        for f in sorted(music_dir.glob("score_*.svg")):
+            pages.append({
+                "page": int(f.stem.split("_")[1]),
+                "url": f"/v1/audio/music/score/{session}/{f.name}",
+            })
+        return JSONResponse({"svg_pages": pages})
+
+    @app.get("/v1/audio/music/score/{session}/piano/{part}")
+    async def music_score_piano(session: str, part: str):
+        """Piano-render one part on demand."""
+        if part not in ("mix", "vocal", "instrumental"):
+            raise HTTPException(404, "Unknown part")
+        
+        music_dir = _music_output_dir / session
+
+        target = music_dir / f"piano_{part}.wav"
+        if not target.exists():
+            try:
+                await asyncio.to_thread(_ensure_playback_bundle, music_dir)
+            except HTTPException:
+                raise
+            midi = music_dir / "transcription.mid"
+            if not midi.exists():
+                raise HTTPException(404, "No transcription for this session")
+            
+            def _render():
+                from veloxvoice.audio.music_rendering import render_outputs
+
+                render_assets = Path(__file__).resolve().parents[2] / "render_assets"
+                render_outputs(input_dir=music_dir, output_dir=music_dir,
+                               audio=True, parts=(part,),
+                               assets_dir=str(render_assets) if render_assets.exists() else None)
+            
+            await asyncio.to_thread(_render)
+        
+        if not target.exists():
+            raise HTTPException(404, f"No {part} notes in this transcription")
+        return FileResponse(target, media_type="audio/wav")
+
+    @app.post("/v1/audio/music/lyrics")
+    async def music_lyrics_start(session: str = Form(...)):
+        """Start the background lyrics recognition:
+        
+        demucs separation + ASR on the vocal stem.
+        """
+        music_dir = _music_output_dir / session
+        audio_files = ([f for f in music_dir.iterdir()
+                        if f.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg", ".m4a")]
+                       if music_dir.exists() else [])
+        if not audio_files:
+            raise HTTPException(404, f"Session {session} not found")
+        if session in _lyrics_jobs:
+            return JSONResponse({"status": "running"})
+        _lyrics_jobs.add(session)
+        threading.Thread(target=_lyrics_job, args=(session, audio_files[0]),
+                         daemon=True).start()
+        return JSONResponse({"status": "started"})
+
+    @app.get("/v1/audio/music/lyrics/{session}")
+    async def music_lyrics_get(session: str):
+        path = _music_output_dir / session / "lyrics.json"
+        if not path.exists():
+            return JSONResponse({"status": "idle"})
+        return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+
+    def _lyrics_job(session: str, audio_path: Path) -> None:
+        out = _music_output_dir / session / "lyrics.json"
+
+        def write(payload: dict) -> None:
+            out.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+
+        t0 = time.monotonic()
+        try:
+            write({"status": "separating"})
+            separate = _load_separate_fn()
+            vocals, _instrumental = separate(audio_path, _music_output_dir / session,
+                                             device="cuda")
+            separation_s = time.monotonic() - t0
+            write({"status": "transcribing",
+                   "separation_seconds": round(separation_s, 1)})
+            t1 = time.monotonic()
+            text = _asr_vocals(vocals)
+            asr_s = time.monotonic() - t1
+            write({"status": "done", "lyrics": text,
+                   "separation_seconds": round(separation_s, 1),
+                   "asr_seconds": round(asr_s, 1),
+                   "total_seconds": round(time.monotonic() - t0, 1)})
+        except Exception as exc:  # noqa: BLE001 — surfaced to the client
+            write({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            _lyrics_jobs.discard(session)
+
+    def _load_separate_fn():
+        import importlib.util
+
+        tool = Path(__file__).resolve().parents[2] / "tools" / "music" / "separate_vocals.py"
+        spec = importlib.util.spec_from_file_location("velox_separate_vocals", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.separate
+
+    def _asr_vocals(vocals_path: Path) -> str:
+        """Transcribe the vocal stem with the ASR (16 kHz mono PCM)."""
+        import soundfile as sf
+
+        from veloxvoice.api import _resample_pcm16k
+
+        pcm, sr = sf.read(str(vocals_path), dtype="float32", always_2d=True)
+        pcm = np.asarray(pcm.mean(axis=1), dtype=np.float32).reshape(-1)
+        if sr != 16000:
+            pcm = _resample_pcm16k(pcm, sr)
+        pcm = np.asarray(pcm, dtype=np.float32).reshape(-1)
+        if pcm.size > 16000 * 60 * 12:
+            pcm = pcm[:16000 * 60 * 12]  # cap at 12 minutes for the demo
+        return vx.transcribe_pcm(pcm).text
+
+    @app.get("/v1/audio/music/score/{session}/render/{page_num}")
+    async def music_score_render(session: str, page_num: int):
+        """Render ONE page of sheet music as SVG (on-demand, lazy)."""
+        music_dir = _music_output_dir / session
+        svg_file = music_dir / f"score_{page_num:03d}.svg"
+        if svg_file.exists():
+            return FileResponse(svg_file, media_type="image/svg+xml")
+
+        # render this page (playwright)
+        render_assets = Path(__file__).resolve().parents[4] / "render_assets"
+        if not render_assets.exists():
+            render_assets = Path(__file__).parent / "render_assets"
+
+        def _render():
+            from veloxvoice.audio.music_rendering import render_outputs
+            render_outputs(
+                input_dir=music_dir, output_dir=music_dir,
+                score="svg", audio=False,
+                assets_dir=str(render_assets))
+
+        await asyncio.to_thread(_render)
+
+        if svg_file.exists():
+            return FileResponse(svg_file, media_type="image/svg+xml")
+        raise HTTPException(404, f"Page {page_num} render failed")
+
+    @app.get("/v1/audio/music/score/{session}/{filename}")
+    async def music_score_file(session: str, filename: str):
+        """Serve SVG/PNG/MIDI/WAV files from the music output directory."""
+        safe = _safe_filename(filename)
+        path = _music_output_dir / session / safe
+        if not path.exists() and safe in ("transcription.mid", "chords.mid",
+                                          "playback.json"):
+            await asyncio.to_thread(_ensure_playback_bundle,
+                                    _music_output_dir / session)
+        if not path.exists():
+            raise HTTPException(404, "File not found")
+        media = {
+            ".svg": "image/svg+xml", ".png": "image/png",
+            ".mid": "audio/midi", ".wav": "audio/wav",
+            ".abc": "text/plain", ".json": "application/json",
+            ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+            ".flac": "audio/flac", ".ogg": "audio/ogg",
+        }
+        ext = path.suffix.lower()
+        return FileResponse(path, media_type=media.get(ext, "application/octet-stream"))
+
     @app.get("/client", include_in_schema=False, response_class=HTMLResponse)
     async def client() -> HTMLResponse:
         return HTMLResponse(_CLIENT_HTML)
 
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        # keep browser consoles clean: the tab icon is served inline
+        svg = ("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>"
+               "<text y='13' font-size='13'>🎵</text></svg>")
+        return Response(svg, media_type="image/svg+xml")
+
     @app.get("/sitemap.xml")
     async def sitemap(request: Request) -> Response:
         base = str(request.base_url).rstrip("/")
-        urls = ["/docs", "/api"]
+        urls = ["/docs", "/api", "/client"]
+        if has_music:
+            urls += ["/v1/audio/music/transcriptions", "/v1/audio/music/upload"]
         items = "".join(
             f"<url><loc>{base}{path}</loc><changefreq>monthly</changefreq></url>"
             for path in urls
@@ -826,470 +1183,39 @@ def create_app(
 
     @app.get("/api")
     async def api_index() -> JSONResponse:
+        routes = {
+            "health": "/health",
+            "models": "/v1/models",
+            "client": "/client",
+            "transcriptions": "/v1/audio/transcriptions",
+        }
+        if has_music:
+            routes["music_transcriptions"] = "/v1/audio/music/transcriptions"
         return JSONResponse(
             {
-                "name": "VeloxVoice ASR",
+                "name": "VeloxVoice",
+                "model_type": "asr+music" if has_music else "asr",
+                "routes": routes,
                 "docs": "/docs",
                 "openapi": "/openapi.json",
-                "routes": {
-                    "health": "/health",
-                    "models": "/v1/models",
-                    "client": "/client",
-                    "sitemap": "/sitemap.xml",
-                    "transcriptions": "/v1/audio/transcriptions",
-                    "uploads": "/v1/audio/uploads",
-                    "websocket": "/v1/audio/ws",
-                },
-                "quickstart": {
-                    "method": "POST",
-                    "url": "/v1/audio/transcriptions",
-                    "content_type": "multipart/form-data",
-                    "required_field": "file",
-                    "streaming_field": "stream",
-                },
             }
         )
 
     return app
 
 
-_CLIENT_HTML = r"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>VeloxVoice ASR Client</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font: 15px/1.5 system-ui,sans-serif; max-width: 900px; margin: 30px auto; }
-    h1 { font-size: 22px; margin-bottom: 14px; }
-    .card { background: #f7f7f8; border-radius: 12px; padding: 18px; }
-    .drop { border: 2px dashed #bbb; border-radius: 10px; padding: 22px; text-align: center; cursor: pointer; }
-    .drop.drag { border-color: #10a37f; background: #e8f7f2; }
-    button { font-size: 15px; padding: 8px 14px; border-radius: 8px; border: 0; background: #10a37f; color: white; cursor: pointer; }
-    button.live { background: #7c3aed; }
-    button:disabled { opacity: .5; cursor: not-allowed; }
-    input[type=file] { display: none; }
-    select { padding: 6px; border-radius: 6px; }
-    .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
-    .progress-label { display: flex; justify-content: space-between; gap: 10px; color: #555; font-size: 13px; margin-top: 6px; }
-    .progress { height: 6px; background: #ddd; border-radius: 3px; overflow: hidden; margin-top: 12px; }
-    .progress > div { height: 100%; width: 0%; background: #10a37f; transition: width .2s; }
-    #asrBar { background: #7c3aed; }
-    pre { white-space: pre-wrap; background: #0f172a; color: #d1d5db; padding: 14px; border-radius: 8px; min-height: 150px; }
-    .meta { color: #666; font-size: 13px; margin-top: 8px; }
-  </style>
-</head>
-<body>
-  <h1>VeloxVoice ASR Client</h1>
-  <div class="card">
-    <div class="drop" id="drop">
-      <b>Select audio</b><br>
-      <small>MP3, WAV, FLAC, M4A, OGG, MP4…</small>
-    </div>
-    <input type="file" id="file" accept="audio/*,video/*" />
-    <div class="actions">
-      <select id="pool">
-        <option value="5" selected>5s pool</option>
-        <option value="10">10s pool</option>
-        <option value="20">20s pool</option>
-        <option value="30">30s pool</option>
-      </select>
-      <label id="rescoreLabel" title="attention rescoring (slower, slightly more accurate)">
-        <input type="checkbox" id="rescore" /> rescore
-      </label>
-      <button id="uploadBtn" disabled>Upload</button>
-      <button id="transcribeBtn" disabled>Transcribe (after uploading)</button>
-      <button id="webrtcBtn" class="live" disabled>Transcribing (WebRTC)</button>
-    </div>
-
-    <div class="progress"><div id="uploadBar"></div></div>
-    <div class="progress-label"><span id="uploadLabel">Upload</span><span id="uploadStatus">Idle</span></div>
-
-    <div class="progress"><div id="asrBar"></div></div>
-    <div class="progress-label"><span id="asrLabel">Transcribing</span><span id="asrStatus">Idle</span></div>
-
-    <pre id="out">Waiting for audio…</pre>
-    <div class="meta">
-      API docs: <code>/docs</code>. Live streaming: <code>/v1/audio/ws</code>.
-      Live mode emits a short 1s first partial, then uses the selected pool cadence.
-    </div>
-  </div>
-<script>
-const fileInput = document.querySelector('#file');
-const drop = document.querySelector('#drop');
-const poolSel = document.querySelector('#pool');
-const rescoreChk = document.querySelector('#rescore');
-const uploadBtn = document.querySelector('#uploadBtn');
-const transcribeBtn = document.querySelector('#transcribeBtn');
-const webrtcBtn = document.querySelector('#webrtcBtn');
-const out = document.querySelector('#out');
-const uploadBar = document.querySelector('#uploadBar');
-const asrBar = document.querySelector('#asrBar');
-const uploadLabel = document.querySelector('#uploadLabel');
-const asrLabel = document.querySelector('#asrLabel');
-const uploadStatus = document.querySelector('#uploadStatus');
-const asrStatus = document.querySelector('#asrStatus');
-let selectedFile = null;
-let uploadedId = null;
-let audioDuration = 0;
-let busy = false;
-let ws = null;
-
-function logState(message) {
-  console.log(`[VeloxVoice] ${message}`);
-}
-
-function seconds(value) {
-  return `${Number(value).toFixed(2)} s`;
-}
-
-function setProgress(bar, percent) {
-  const value = Math.max(0, Math.min(100, Number(percent) || 0));
-  bar.style.width = `${value}%`;
-}
-
-function setButtons() {
-  uploadBtn.disabled = busy || !selectedFile;
-  transcribeBtn.disabled = busy || !uploadedId;
-  webrtcBtn.disabled = busy || !selectedFile;
-}
-
-function resetForFile(file) {
-  selectedFile = file;
-  uploadedId = null;
-  audioDuration = 0;
-  out.textContent = file ? 'Audio selected. Choose Upload or live WebRTC transcription.' : 'Waiting for audio…';
-  setProgress(uploadBar, 0);
-  uploadLabel.textContent = 'Upload';
-  uploadStatus.textContent = file ? 'Selected' : 'Idle';
-  setProgress(asrBar, 0);
-  asrLabel.textContent = 'Transcribing';
-  asrStatus.textContent = 'Idle';
-  setButtons();
-}
-
-function loadDuration(file) {
-  const media = document.createElement('audio');
-  const url = URL.createObjectURL(file);
-  media.preload = 'metadata';
-  media.onloadedmetadata = () => {
-    audioDuration = Number.isFinite(media.duration) ? media.duration : 0;
-    URL.revokeObjectURL(url);
-    logState(`Audio duration detected: ${seconds(audioDuration)}`);
-  };
-  media.onerror = () => {
-    URL.revokeObjectURL(url);
-    logState('Audio duration detection failed; live progress will use received audio seconds');
-  };
-  media.src = url;
-}
-
-function appendTranscript(text) {
-  if (!text) return;
-  if (out.textContent.startsWith('Waiting for audio') || out.textContent.startsWith('Audio selected')) {
-    out.textContent = '';
-  }
-  out.appendChild(document.createTextNode(text));
-  out.appendChild(document.createElement('br'));
-}
-
-function markTranscribed(wallSeconds, audioSeconds, processingSeconds, rtf) {
-  setProgress(asrBar, 100);
-  asrLabel.textContent = 'Transcribed';
-  const processing = processingSeconds !== undefined
-    ? `Server ${seconds(processingSeconds)}`
-    : null;
-  const rtfText = (rtf !== undefined && Number.isFinite(Number(rtf)))
-    ? `RTF ${Number(rtf).toFixed(5)}`
-    : null;
-  asrStatus.textContent = `Completed in ${seconds(wallSeconds)}`;
-  if (audioSeconds !== undefined) {
-    asrStatus.textContent += ` / Audio ${seconds(audioSeconds)}`;
-  }
-  if (processing) {
-    asrStatus.textContent += ` / ${processing}`;
-  }
-  if (rtfText) {
-    asrStatus.textContent += ` / ${rtfText}`;
-  }
-  logState(`Transcription complete: wall=${seconds(wallSeconds)}, audio=${seconds(audioSeconds || 0)}${processing ? `, server=${processing}` : ''}${rtfText ? `, ${rtfText}` : ''}`);
-}
-
-fileInput.onchange = () => {
-  const file = fileInput.files[0];
-  resetForFile(file);
-  if (file) {
-    loadDuration(file);
-    logState(`Audio selected: ${file.name} (${file.size} bytes)`);
-  } else {
-    logState('Audio selection cleared');
-  }
-};
-
-drop.onclick = () => fileInput.click();
-drop.ondragover = ev => {
-  ev.preventDefault();
-  drop.classList.add('drag');
-};
-drop.ondragleave = () => drop.classList.remove('drag');
-drop.ondrop = ev => {
-  ev.preventDefault();
-  drop.classList.remove('drag');
-  const file = ev.dataTransfer.files[0];
-  resetForFile(file);
-  if (file) {
-    loadDuration(file);
-    logState(`Audio selected: ${file.name} (${file.size} bytes)`);
-  }
-};
-
-function inputFormat(file) {
-  const type = (file.type || '').toLowerCase();
-  const name = (file.name || '').toLowerCase();
-  if (type === 'audio/mpeg' || name.endsWith('.mp3')) return 'mp3';
-  if (type === 'audio/wav' || type === 'audio/x-wav' || name.endsWith('.wav')) return 'wav';
-  if (type === 'audio/flac' || name.endsWith('.flac')) return 'flac';
-  if (type === 'audio/ogg' || name.endsWith('.ogg') || name.endsWith('.opus')) return 'ogg';
-  return 'auto';
-}
-
-function uploadWithProgress() {
-  return new Promise((resolve, reject) => {
-    const form = new FormData();
-    form.append('file', selectedFile);
-    const xhr = new XMLHttpRequest();
-    const startedAt = performance.now();
-    xhr.open('POST', '/v1/audio/uploads');
-    xhr.responseType = 'json';
-    xhr.upload.onprogress = ev => {
-      if (!ev.lengthComputable) return;
-      const percent = 100 * ev.loaded / ev.total;
-      setProgress(uploadBar, percent);
-      uploadStatus.textContent = `Uploading ${Math.round(percent)}%`;
-      logState(`Upload progress: ${Math.round(percent)}%`);
-    };
-    xhr.onload = () => {
-      const elapsed = (performance.now() - startedAt) / 1000;
-      if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
-        setProgress(uploadBar, 100);
-        uploadLabel.textContent = 'Upload';
-        uploadStatus.textContent = `Uploaded in ${seconds(elapsed)}`;
-        logState(`Upload complete in ${seconds(elapsed)}: id=${xhr.response.id}, path=${xhr.response.audio_path}`);
-        resolve(xhr.response);
-      } else {
-        reject(new Error(xhr.response && xhr.response.detail ? xhr.response.detail : `Upload failed (HTTP ${xhr.status})`));
-      }
-    };
-    xhr.onerror = () => reject(new Error('Upload network error'));
-    xhr.send(form);
-  });
-}
-
-uploadBtn.onclick = async () => {
-  if (!selectedFile || busy) return;
-  busy = true;
-  setButtons();
-  logState('Upload started');
-  try {
-    const result = await uploadWithProgress();
-    uploadedId = result.id;
-  } catch (err) {
-    setProgress(uploadBar, 0);
-    uploadStatus.textContent = 'Upload failed';
-    console.error(`[VeloxVoice] Upload error: ${err.message}`);
-    alert(err.message);
-  } finally {
-    busy = false;
-    setButtons();
-  }
-};
-
-async function readSse(response, onEvent) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split(/\r?\n\r?\n/);
-    buffer = events.pop();
-    for (const event of events) {
-      const dataLine = event.split(/\r?\n/).find(line => line.startsWith('data:'));
-      if (dataLine) await onEvent(dataLine.slice(5).trim());
-    }
-  }
-}
-
-transcribeBtn.onclick = async () => {
-  if (!uploadedId || busy) return;
-  busy = true;
-  setButtons();
-  out.textContent = '';
-  setProgress(asrBar, 0);
-  asrLabel.textContent = 'Transcribing';
-  asrStatus.textContent = 'Starting';
-  logState('Post-upload transcription started');
-  const startedAt = performance.now();
-  const form = new FormData();
-  form.append('audio_id', uploadedId);
-  form.append('response_format', 'json');
-  form.append('stream', 'true');
-  form.append('rescore', rescoreChk.checked ? 'true' : 'false');
-  try {
-    const response = await fetch('/v1/audio/transcriptions', { method: 'POST', body: form });
-    if (!response.ok) {
-      const detail = await response.json().catch(() => null);
-      throw new Error(detail && detail.detail ? detail.detail : `Transcription failed (HTTP ${response.status})`);
-    }
-    await readSse(response, async data => {
-      if (data === '[DONE]') return;
-      const obj = JSON.parse(data);
-      if (obj.type === 'transcript.text.delta') {
-        appendTranscript(obj.delta);
-        const percent = obj.progress !== undefined ? obj.progress * 100 : 0;
-        setProgress(asrBar, percent);
-        asrStatus.textContent = `Transcribing ${Math.round(percent)}%`;
-        logState(`Transcription progress: ${Math.round(percent)}%`);
-      } else if (obj.type === 'transcript.text.done') {
-        out.textContent = obj.text;
-        markTranscribed(
-          (performance.now() - startedAt) / 1000,
-          obj.audio_seconds,
-          obj.elapsed_seconds,
-          obj.rtf,
-        );
-      } else if (obj.type === 'error') {
-        throw new Error(obj.error && obj.error.message ? obj.error.message : 'Transcription failed');
-      }
-    });
-  } catch (err) {
-    setProgress(asrBar, 0);
-    asrLabel.textContent = 'Transcribing';
-    asrStatus.textContent = 'Failed';
-    out.textContent = `Error: ${err.message}`;
-    console.error(`[VeloxVoice] Transcription error: ${err.message}`);
-  } finally {
-    busy = false;
-    setButtons();
-  }
-};
-
-webrtcBtn.onclick = async () => {
-  if (!selectedFile || busy) return;
-  busy = true;
-  setButtons();
-  out.textContent = '';
-  setProgress(uploadBar, 0);
-  uploadLabel.textContent = 'Upload';
-  uploadStatus.textContent = 'Connecting';
-  setProgress(asrBar, 0);
-  asrLabel.textContent = 'Transcribing';
-  asrStatus.textContent = 'Starting';
-  const liveStart = performance.now();
-  let uploadStart = performance.now();
-  logState('Live WebRTC transcription started');
-  const wsUrl = `${location.origin.replace(/^http/, 'ws')}/v1/audio/ws`;
-  ws = new WebSocket(wsUrl);
-  try {
-    await new Promise((resolve, reject) => {
-      ws.onopen = () => {
-        logState('Live streaming connection opened');
-        uploadStart = performance.now();
-        uploadStatus.textContent = 'Uploading';
-        ws.send(JSON.stringify({
-          type: 'start',
-          pool_seconds: Number(poolSel.value),
-          format: inputFormat(selectedFile),
-          filename: selectedFile.name,
-          rescore: rescoreChk.checked,
-        }));
-        resolve();
-      };
-      ws.onerror = () => {
-        uploadStatus.textContent = 'Failed';
-        asrStatus.textContent = 'Failed';
-        console.error('[VeloxVoice] Live streaming connection error');
-        reject(new Error('Live streaming connection failed'));
-      };
-    });
-  } catch (err) {
-    busy = false;
-    setButtons();
-    return;
-  }
-
-  ws.onmessage = ev => {
-    const obj = JSON.parse(ev.data);
-    if (obj.type === 'partial') {
-      appendTranscript(obj.text);
-      if (audioDuration > 0) {
-        const percent = 100 * obj.audio_seconds / audioDuration;
-        setProgress(asrBar, percent);
-        asrStatus.textContent = `Transcribing ${Math.round(percent)}%`;
-        logState(`Live transcription progress: ${Math.round(percent)}%`);
-      } else {
-        asrStatus.textContent = `Transcribed ${seconds(obj.audio_seconds)}`;
-        logState(`Live transcription progress: ${seconds(obj.audio_seconds)} received`);
-      }
-    } else if (obj.type === 'final') {
-      out.textContent = obj.text;
-      markTranscribed(
-        (performance.now() - liveStart) / 1000,
-        obj.audio_seconds,
-        obj.elapsed_seconds,
-        obj.rtf,
-      );
-    } else if (obj.type === 'error') {
-      out.textContent = `Error: ${obj.detail}`;
-      setProgress(asrBar, 0);
-      asrLabel.textContent = 'Transcribing';
-      asrStatus.textContent = 'Failed';
-      console.error(`[VeloxVoice] Live transcription error: ${obj.detail}`);
-    }
-  };
-  ws.onclose = () => {
-    logState('Live streaming connection closed');
-    busy = false;
-    setButtons();
-  };
-  ws.onerror = () => {
-    uploadStatus.textContent = 'Failed';
-    asrStatus.textContent = 'Failed';
-    console.error('[VeloxVoice] Live streaming connection error');
-  };
-
-  const chunkSize = 1024 * 1024 * 4;
-  let offset = 0;
-  try {
-    while (offset < selectedFile.size && ws.readyState === 1) {
-      const buf = await selectedFile.slice(offset, offset + chunkSize).arrayBuffer();
-      ws.send(buf);
-      offset += buf.byteLength;
-      const percent = 100 * offset / selectedFile.size;
-      setProgress(uploadBar, percent);
-      uploadStatus.textContent = `Uploading ${Math.round(percent)}%`;
-      logState(`Live upload progress: ${Math.round(percent)}%`);
-    }
-    if (ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'stop' }));
-      setProgress(uploadBar, 100);
-      uploadStatus.textContent = `Uploaded in ${seconds((performance.now() - uploadStart) / 1000)}`;
-      logState(`Live upload complete in ${seconds((performance.now() - uploadStart) / 1000)}; waiting for final transcription`);
-    }
-  } catch (err) {
-    console.error(`[VeloxVoice] Live upload error: ${err.message}`);
-  }
-};
-</script>
-</body>
-</html>
-"""
+_CLIENT_HTML_PATH = Path(__file__).parent / "templates" / "music_client.html"
+_CLIENT_HTML = _CLIENT_HTML_PATH.read_text(encoding="utf-8") if _CLIENT_HTML_PATH.exists() else "<html><body>music_client.html not found</body></html>"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run VeloxVoice SGLang-Omni ASR server")
     ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--base-model-dir", default="",
+                    help="MERT-v2-FullSong encoder dir (music recognition)")
+    ap.add_argument("--music-model-dir", default="",
+                    help="SheetSage2 checkpoint dir (music recognition); "
+                         "requires --base-model-dir")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--device", default="cuda")
@@ -1297,7 +1223,7 @@ def main() -> None:
         "--precision",
         default="bf16",
         choices=("fp16", "bf16", "fp32"),
-        help="model precision lane; env VELOXVOICE_PRECISION overrides it "
+        help="model precision; env VELOXVOICE_PRECISION overrides it "
              "(fp16=fp32 weights+autocast, fp32=high-precision, bf16=default)",
     )
     ap.add_argument("--pool-seconds", type=float, default=20.0)
@@ -1308,6 +1234,8 @@ def main() -> None:
 
     app = create_app(
         model_dir=args.model_dir,
+        music_model_dir=args.music_model_dir or None,
+        base_model_dir=args.base_model_dir or None,
         device=args.device,
         precision=args.precision,
         enable_graphs=not args.no_graphs,
