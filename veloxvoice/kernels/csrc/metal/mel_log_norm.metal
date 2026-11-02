@@ -1,0 +1,9 @@
+uint i = thread_position_in_grid.x;
+if (i >= (TF - 1) * M) return;
+uint t = i / M;
+uint m = i % M;
+float p = (float)x[t * M + m];
+p = 10.0f * metal::log10(metal::max(p, 1e-10f));
+float mu = (float)mean[m];
+float sd = metal::max((float)std[m], 1e-5f);
+out[i] = (T)((p - mu) / sd);
