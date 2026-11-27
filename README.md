@@ -58,8 +58,23 @@ This restul fundamental changed the streaming logics of previous audio tasks, wh
 
 **New ASR for Music notes in multiple tracks**
 
+#### Snaphost
 <div align="center">
-  <video src="https://github.com/user-attachments/assets/54a7868a-5fe7-42a3-85b8-824c94f6c8f8" width="60%"> </video>
+   <img alt="Velox Voice" src="https://github.com/user-attachments/assets/54a7868a-5fe7-42a3-85b8-824c94f6c8f8" width="60%">
+</div>
+
+
+#### w/o vocals transcribing
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/7420efed-cea4-443d-beef-c67b17f70dde
+" width="100%"> </video>
+</div>
+
+#### w/ vocals transcribing
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/f1c94a00-bba0-4f78-8e4b-ef8c7dd1e50b" width="100%"> </video>
 </div>
 
 Traditional ASR transcribe audio with vocals merely into text. For a piece of melody with vocals, the text can be lyrics, music notes and they can span in different tracks as their pitches vary.
