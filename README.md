@@ -19,6 +19,8 @@ This repository is porting our "Flash Float JIT Kernels" into audio tasks. Besid
 
 - Oct 16 2026, [📣 update rescore algorithm, prefix beam serach is 3999x faster 💥](https://github.com/yiakwy-xpu-ml-framework-team/velox-voice/pull/13), with 13.2% Corpus CER for AISHELL-4 and updated [accuracy coverage](https://github.com/yiakwy-xpu-ml-framework-team/velox-voice/blob/main/benchmark/accuracy/accuracy.md)
 
+- Nov 27 2026, [🎹 land our new ASR, i.e. Audio Symbol Recognition with CUDA backend; RTF 0.01 achieved in DGX Spark for 1600 steps, RTF 0.001 in Hopper](https://github.com/yiakwy-xpu-ml-framework-team/velox-voice/pull/21)
+
 <h2 id="Transcribing-1-hrs-audio-in-seconds-on-dgx-spark">🔥 Transcribing 1-hour audio in seconds on DGX Spark</h2>
 
 **Transcribing 1-hour audio into few seconds**
@@ -51,6 +53,18 @@ This restul fundamental changed the streaming logics of previous audio tasks, wh
 | multi worker, 1-h audio     | dgx spark (GB10) |   5.3  s   | **0.0015** |
 | multi worker, 1-h audio     | Hopper superPod  | **997 ms** | **0.0003** |
 
+
+**New ASR for Music**
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/54a7868a-5fe7-42a3-85b8-824c94f6c8f8" width="60%"> </video>
+</div>
+
+Traditional ASR transcribe audio with vocals merely into text. In an music the text can be lyrics, music notes and they can span in different tracks as their pitches vary.
+
+Introducing the new ASR, we can transcribe music into notes of left hand piano, right hand side piano and underlying bass. Besides after separating vocles from instruments, we can capture the lyrics definitely.
+
+For more advantage use, see our free software **VeloxForge** for personal users, powered and hosted by our proprietory computing agent and platforms.
 
 ## Overview
 
