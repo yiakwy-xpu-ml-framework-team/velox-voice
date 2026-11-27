@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -25,6 +26,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import uuid4
@@ -497,7 +499,7 @@ def _music_warmup_by_model(model, device):
 
 
 def create_app(
-    model_dir: str | Path,
+    model_dir: str | Path | None = None,
     device: str = "cuda",
     precision: str = "bf16",
     enable_graphs: bool = True,
@@ -507,7 +509,8 @@ def create_app(
     base_model_dir: str | Path | None = None,
 ) -> FastAPI:
     app = FastAPI(title="VeloxVoice ASR", version="0.1.0")
-    app.state.model_name = Path(model_dir).name
+    _model_root = model_dir or music_model_dir or "veloxvoice"
+    app.state.model_name = Path(_model_root).name
     app.state.uploads = {}
     app.add_middleware(
         CORSMiddleware,
@@ -516,16 +519,22 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    vx = Velox.load(
-        model_dir,
-        backend="torch",
-        device=device,
-        native_kernels=True,
-        kernel_precision=precision,
-        enable_graphs=enable_graphs,
-    )
+    # ASR is optional: a music-only server passes model_dir=None and loads
+    # SheetSage2 below. Velox.load forwards base_model_dir so a SheetSage2
+    # checkpoint can also be passed directly as model_dir.
+    vx = None
+    if model_dir:
+        vx = Velox.load(
+            model_dir,
+            backend="torch",
+            device=device,
+            native_kernels=True,
+            kernel_precision=precision,
+            enable_graphs=enable_graphs,
+            base_model_dir=str(base_model_dir) if base_model_dir else "",
+        )
     upload_dir = Path(upload_dir)
-    is_music = getattr(vx, "kind", "") == "sheetsage2"
+    is_music = vx is not None and getattr(vx, "kind", "") == "sheetsage2"
 
     # music recognition: load SheetSage2 + MERT-v2 in addition to ASR
     model_music = None
@@ -535,7 +544,16 @@ def create_app(
         model_music = sheetsage_api.load_model(
             str(music_model_dir), str(base_model_dir), "bf16", device)
         print(f"[VeloxVoice] music model loaded: {music_model_dir}")
+    elif is_music:
+        # model_dir was itself a SheetSage2 checkpoint; reuse what Velox.load
+        # already built instead of loading the weights twice.
+        model_music = getattr(vx, "_music_model", None)
     has_music = model_music is not None
+    if vx is None and not has_music:
+        raise ValueError(
+            "create_app needs either an ASR model_dir or "
+            "(music_model_dir + base_model_dir)"
+        )
 
     async def _do_music_transcribe(audio_path: str, out_dir: Path):
         from veloxvoice.models.sheetsage.v2 import api as sheetsage_api
@@ -546,18 +564,16 @@ def create_app(
 
     @app.on_event("startup")
     async def _startup() -> None:
-        await asyncio.to_thread(
-            lambda: vx.warmup((0.5, 1.0, 5.0, 10.0, pool_seconds, 30.0))
-        )
+        if vx is not None and hasattr(vx, "warmup"):
+            await asyncio.to_thread(
+                lambda: vx.warmup((0.5, 1.0, 5.0, 10.0, pool_seconds, 30.0))
+            )
         if has_music:
-            # schedule music warmup AFTER server starts accepting connections
-            asyncio.get_event_loop().call_later(
-                1.0,
-                lambda: asyncio.ensure_future(
-                    asyncio.to_thread(
-                        lambda: _music_warmup_by_model(model_music, device)
-                    )
-                )
+            # Warm up before accepting requests: the first real transcription
+            # otherwise pays the JIT/capture cost (observed 6-29 s) and looks
+            # like a stalled progress bar.
+            await asyncio.to_thread(
+                lambda: _music_warmup_by_model(model_music, device)
             )
 
     @app.get("/health")
@@ -568,10 +584,12 @@ def create_app(
     async def healthz() -> dict[str, Any]:
         return {
             "ok": True,
-            "device": vx.platform.device,
-            "precision": vx.precision,
-            "graphs": vx.enable_graphs,
+            "device": getattr(getattr(vx, "platform", None), "device", device),
+            "precision": getattr(vx, "precision", precision),
+            "graphs": getattr(vx, "enable_graphs", enable_graphs),
             "pool_seconds": pool_seconds,
+            "asr": vx is not None,
+            "music": has_music,
         }
 
     @app.get("/v1/models")
@@ -862,54 +880,274 @@ def create_app(
                 await session.close()
             await ws.close()
 
-    @app.get("/", include_in_schema=False)
-    async def root() -> RedirectResponse:
-        return RedirectResponse(url="/docs", status_code=307)
+    @app.get("/", include_in_schema=False, response_class=HTMLResponse)
+    async def root() -> HTMLResponse:
+        return HTMLResponse(_CLIENT_HTML)
 
     # ── music recognition endpoints ──────────────────────────────────────────────
-    _music_output_dir = Path("/tmp/veloxvoice_music_output")
+    # Sessions must survive a server restart (and a reboot), so do not use /tmp
+    # by default.  Override with VELOX_MUSIC_OUTPUT_DIR when the data belongs
+    # on another volume.
+    _default_music_root = (Path(__file__).resolve().parents[2]
+                           / "output" / "music_sessions")
+    _music_output_dir = Path(os.environ.get(
+        "VELOX_MUSIC_OUTPUT_DIR") or _default_music_root)
+    try:
+        _music_output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Last-resort demo fallback; the startup warning makes this visible.
+        _music_output_dir = Path("/tmp/veloxvoice_music_output")
+        _music_output_dir.mkdir(parents=True, exist_ok=True)
+    _music_index_path = _music_output_dir / "_index.json"
+    _music_index_lock = threading.Lock()
     _lyrics_jobs: set[str] = set()
+    _audio_suffixes = (".mp3", ".wav", ".flac", ".ogg", ".m4a")
+    _derived_audio_names = {
+        "vocals.wav", "instrumental.wav", "no_vocals.wav",
+        "piano_A_synth.wav", "piano_B.wav",
+        "piano_mix.wav", "piano_vocal.wav", "piano_instrumental.wav",
+    }
+
+    def _original_audio_files(music_dir: Path) -> list[Path]:
+        """Uploaded song only — never an exact generated stem/piano render."""
+        return [f for f in music_dir.iterdir()
+                if f.is_file() and f.suffix.lower() in _audio_suffixes
+                and f.name not in _derived_audio_names]
+
+    def _read_music_index() -> dict:
+        if not _music_index_path.exists():
+            return {}
+        try:
+            data = json.loads(_music_index_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_music_index(index: dict) -> None:
+        tmp = _music_index_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(index, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(_music_index_path)
+
+    def _session_meta(session: str) -> dict:
+        path = _music_output_dir / session / "session_meta.json"
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _session_list_item(session_dir: Path) -> dict | None:
+        session = session_dir.name
+        try:
+            audio_files = _original_audio_files(session_dir)
+        except Exception:
+            return None
+        meta = _session_meta(session)
+        result = {}
+        result_path = session_dir / "result.json"
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            except Exception:
+                result = {}
+        playback = {}
+        playback_path = session_dir / "playback.json"
+        if playback_path.exists():
+            try:
+                playback = json.loads(playback_path.read_text(encoding="utf-8"))
+            except Exception:
+                playback = {}
+        lyrics = {}
+        lyrics_path = session_dir / "lyrics.json"
+        if lyrics_path.exists():
+            try:
+                lyrics = json.loads(lyrics_path.read_text(encoding="utf-8"))
+            except Exception:
+                lyrics = {}
+        timed = bool(lyrics.get("lines"))
+        has_piano = (session_dir / "piano_A_notes.json").exists()
+        has_stems = ((session_dir / "vocals.wav").is_file() and
+                     (session_dir / "instrumental.wav").is_file())
+        has_vocal = any(
+            str(track.get("name", "")).lower().startswith("vocal") and
+            track.get("notes")
+            for track in playback.get("tracks", []))
+        filename = (meta.get("original_filename") or
+                    (audio_files[0].name if audio_files else
+                     f"{session}.wav"))
+        title = Path(filename).stem or session
+        duration = (result.get("duration_seconds") or
+                    playback.get("duration") or 0)
+        staff_mode = "a" if has_piano else "sheet"
+        # Directory mtime is the copy/creation time and can be newer than the
+        # artifacts.  Use the newest meaningful file for "updated_at".
+        stamp_names = (
+            "result.json", "playback.json", "lyrics.json",
+            "score.abc", "sheet_staff_events.json",
+            "piano_A_staff_events.json", "piano_B_staff_events.json",
+            "piano_A_notes.json", "piano_B.wav",
+            "vocals.wav", "instrumental.wav",
+        )
+        stamps = [(session_dir / name).stat().st_mtime
+                  for name in stamp_names
+                  if (session_dir / name).is_file()]
+        if audio_files:
+            stamps.append(audio_files[0].stat().st_mtime)
+        mtime = max(stamps) if stamps else session_dir.stat().st_mtime
+        created = meta.get("created_at")
+        if not created:
+            created = datetime.fromtimestamp(mtime, timezone.utc).isoformat()
+        return {
+            "session": session,
+            "title": title,
+            "filename": filename,
+            "duration_seconds": round(float(duration), 2) if duration else None,
+            "num_events": result.get("num_events"),
+            "engine": "piano" if has_piano else "sheetsage",
+            "staff_mode": staff_mode,
+            "has_piano": has_piano,
+            "has_stems": has_stems,
+            "has_vocal": has_vocal,
+            "has_timed_lyrics": timed,
+            "lyrics_source": lyrics.get("source"),
+            "has_lyrics": bool(lyrics.get("lyrics") or timed),
+            "created_at": created,
+            "updated_at": datetime.fromtimestamp(
+                mtime, timezone.utc).isoformat(),
+            "client_url": f"/client?tab=music&session={session}",
+            "staff_url": f"/piano-staff?session={session}&mode={staff_mode}",
+        }
 
     @app.post("/v1/audio/music/upload")
     async def music_upload(file: UploadFile = File(...)) -> JSONResponse:
-        """Upload a song for music transcription."""
+        """Upload a song; identical content reuses the existing session."""
         data = await file.read()
         if not data:
             raise HTTPException(400, "Uploaded audio file is empty")
-        upload_id = uuid4().hex[:12]
-        music_dir = _music_output_dir / upload_id
-        music_dir.mkdir(parents=True, exist_ok=True)
-        audio_path = music_dir / (file.filename or "song.mp3")
-        audio_path.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        safe_name = _safe_filename(file.filename or "song.mp3")
+        with _music_index_lock:
+            index = _read_music_index()
+            existing = index.get(digest)
+            existing_session = (existing.get("session")
+                                if isinstance(existing, dict) else None)
+            existing_dir = (_music_output_dir / existing_session
+                            if existing_session else None)
+            existing_audio = (_original_audio_files(existing_dir)
+                              if existing_dir is not None and
+                              existing_dir.is_dir() else [])
+            if existing_dir is not None and existing_audio:
+                audio_path = existing_audio[0]
+                meta = _session_meta(existing_session)
+                return JSONResponse({
+                    "upload_id": existing_session,
+                    "session": existing_session,
+                    "reused": True,
+                    "filename": meta.get("original_filename") or
+                                file.filename,
+                    "saved_filename": audio_path.name,
+                    "audio_path": str(audio_path),
+                    "size": audio_path.stat().st_size
+                            if audio_path.exists() else len(data),
+                    "sha256": digest,
+                    "client_url": f"/client?tab=music&session={existing_session}",
+                    "staff_url": f"/piano-staff?session={existing_session}"
+                                 f"&mode=sheet",
+                })
+
+            upload_id = uuid4().hex[:12]
+            music_dir = _music_output_dir / upload_id
+            music_dir.mkdir(parents=True, exist_ok=True)
+            audio_path = music_dir / safe_name
+            audio_path.write_bytes(data)
+            created_at = datetime.now(timezone.utc).isoformat()
+            meta = {
+                "session": upload_id,
+                "original_filename": file.filename or safe_name,
+                "saved_filename": safe_name,
+                "size": len(data),
+                "sha256": digest,
+                "created_at": created_at,
+            }
+            (music_dir / "session_meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+            index[digest] = {
+                "session": upload_id,
+                "filename": file.filename or safe_name,
+                "saved_filename": safe_name,
+                "size": len(data),
+                "created_at": created_at,
+            }
+            _write_music_index(index)
         return JSONResponse({
             "upload_id": upload_id,
+            "session": upload_id,
+            "reused": False,
             "filename": file.filename,
+            "saved_filename": safe_name,
             "audio_path": str(audio_path),
             "size": len(data),
+            "sha256": digest,
+            "client_url": f"/client?tab=music&session={upload_id}",
+            "staff_url": f"/piano-staff?session={upload_id}&mode=sheet",
         })
 
     @app.post("/v1/audio/music/transcriptions")
-    async def music_transcribe(upload_id: str = Form(...)):
-        """Music audio to lead sheet (ABC + SVG score + MIDI)."""
+    async def music_transcribe(upload_id: str = Form(...),
+                               engine: str = Form("sheetsage")):
+        """Music audio to lead sheet (ABC + SVG score + MIDI) or piano staff."""
         music_dir = _music_output_dir / upload_id
         if not music_dir.exists():
             raise HTTPException(404, f"Upload {upload_id} not found")
 
-        audio_files = [f for f in music_dir.iterdir()
-                       if f.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg", ".m4a")]
-        
+        audio_files = _original_audio_files(music_dir)
         if not audio_files:
             raise HTTPException(404, "No audio file in upload")
 
         audio_path = audio_files[0]
+        if engine not in ("sheetsage", "piano"):
+            raise HTTPException(400, "engine must be sheetsage or piano")
+
+        from veloxvoice.audio.piano_engine import (
+            build_sheet_staff, run_bundle, session_duration)
 
         _t0 = time.monotonic()
         result = await _do_music_transcribe(str(audio_path), music_dir)
         _t1 = time.monotonic()
         print(f"[music-timing] model: {(_t1-_t0)*1000:.0f}ms")
 
-        _t2 = time.monotonic()
-        print(f"[music-timing] response build: {(_t2-_t1)*1000:.0f}ms")
+        _base = "/v1/audio/music/score/" + music_dir.name
+        elapsed = result.get("elapsed_seconds", 0)
+        duration_s = (result.get("duration_seconds") or
+                      await asyncio.to_thread(session_duration, music_dir))
+        abc_text = None
+        metrics = None
+        staff_mode = "sheet"
+        view = "scroll_staff"
+        staff_started = time.monotonic()
+
+        if engine == "piano":
+            _ta = time.monotonic()
+            metrics = await asyncio.to_thread(
+                run_bundle, str(audio_path), music_dir)
+            _tb = time.monotonic()
+            print(f"[music-timing] piano A/B bundle: {(_tb-_ta)*1000:.0f}ms")
+            staff_mode = "a"
+            view = "piano_staff"
+        else:
+            # Build the one-row three-track staff now, so the iframe opens
+            # instantly and the transcribe wall time includes the real work.
+            await asyncio.to_thread(build_sheet_staff, music_dir)
+
+        abc_file = music_dir / (
+            "piano_A_staff.abc" if engine == "piano" else "sheet_staff.abc")
+        if abc_file.exists():
+            abc_text = abc_file.read_text(encoding="utf-8", errors="replace")
+        staff_elapsed = time.monotonic() - staff_started
 
         svg_pages = []
         for f in sorted(music_dir.glob("score_*.svg")):
@@ -917,26 +1155,26 @@ def create_app(
                 "page": int(f.stem.split("_")[1]),
                 "url": f"/v1/audio/music/score/{music_dir.name}/{f.name}",
             })
-        
-        abc_text = None
-        abc_file = music_dir / "score.abc"
-        if abc_file.exists():
-            abc_text = abc_file.read_text()
 
-        elapsed = result.get("elapsed_seconds", 0)
-        duration_s = result.get("duration_seconds", 0)
+        _t2 = time.monotonic()
+        print(f"[music-timing] response build: {(_t2-_t1)*1000:.0f}ms")
+        print(f"[music-timing] staff build: {staff_elapsed*1000:.0f}ms")
 
-        _base = "/v1/audio/music/score/" + music_dir.name
-
-        # see TEST_API.md
-        return JSONResponse({
+        payload = {
+            "view": view,
+            "engine": engine,
+            "staff_mode": staff_mode,
+            "staff_url": (f"/piano-staff?session={music_dir.name}"
+                          f"&mode={staff_mode}"),
+            "client_url": f"/client?tab=music&session={music_dir.name}",
             "abc": abc_text,
             "abc_measures": result.get("abc_measures", 0),
             "abc_error": result.get("abc_error"),
             "svg_pages": svg_pages,
             "pages_pending": not svg_pages,
             "pages_list_url": _base + "/pages",
-            "num_events": result.get("num_events", 0),
+            "num_events": (metrics.get("A", {}).get("notes")
+                           if metrics else result.get("num_events", 0)),
             "duration_seconds": duration_s,
             "output_dir": str(music_dir),
             "session": music_dir.name,
@@ -957,11 +1195,15 @@ def create_app(
                 "elapsed_seconds": round(elapsed, 3),
                 "audio_duration_seconds": round(duration_s, 3),
                 "rtf": round(elapsed / duration_s, 5) if duration_s > 0 else None,
-                "wall_time_seconds": round(elapsed, 3),
+                "wall_time_seconds": round(time.monotonic() - _t0, 3),
+                "staff_elapsed_seconds": round(staff_elapsed, 3),
                 "num_tokens": len(result.get("tokens", [])[0]) if result.get("tokens") else 0,
                 "num_windows": len(result.get("tokens", [])),
             },
-        })
+        }
+        if metrics is not None:
+            payload["metrics"] = metrics
+        return JSONResponse(payload)
 
     def _ensure_playback_bundle(music_dir: Path) -> None:
         """Rebuild the playback MIDI bundle from melody.mid + chord.lab when absent"""
@@ -980,6 +1222,95 @@ def create_app(
         from veloxvoice.audio.music_midi import export_playback
 
         export_playback(music_dir, None, duration)
+
+    @app.get("/v1/audio/music/session/{session}")
+    async def music_session_info(session: str):
+        """Return the artifacts of an existing transcription session.
+
+        Used by the demo page to reopen a session without re-uploading.
+        """
+        music_dir = _music_output_dir / session
+        if not music_dir.exists():
+            raise HTTPException(404, f"Session {session} not found")
+        audio_files = _original_audio_files(music_dir)
+        if not audio_files:
+            raise HTTPException(404, "No audio file in session")
+        audio = audio_files[0]
+        base = f"/v1/audio/music/score/{session}"
+        result = {}
+        result_path = music_dir / "result.json"
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            except Exception:
+                result = {}
+        midi = {}
+        for part, name in (("full", "transcription.mid"),
+                           ("vocal", "melody_vocal.mid"),
+                           ("instrumental", "melody_instrumental.mid"),
+                           ("chords", "chords.mid")):
+            if (music_dir / name).exists():
+                midi[part] = f"{base}/{name}"
+        piano = {}
+        for part in ("mix", "vocal", "instrumental"):
+            if (music_dir / f"piano_{part}.wav").exists():
+                piano[part] = f"/v1/audio/music/score/{session}/piano/{part}"
+        staff_mode = "a" if (music_dir / "piano_A_notes.json").exists() else "sheet"
+        staff_abc = ("piano_A_staff.abc" if staff_mode == "a"
+                     else "sheet_staff.abc")
+        abc_name = (staff_abc if (music_dir / staff_abc).exists()
+                    else "score.abc")
+        meta = _session_meta(session)
+        lyrics = {}
+        lyrics_path = music_dir / "lyrics.json"
+        if lyrics_path.exists():
+            try:
+                lyrics = json.loads(lyrics_path.read_text(encoding="utf-8"))
+            except Exception:
+                lyrics = {}
+        return JSONResponse({
+            "session": session,
+            "title": Path(meta.get("original_filename") or audio.name).stem,
+            "created_at": meta.get("created_at"),
+            "audio_url": f"{base}/{audio.name}",
+            "abc_url": f"{base}/{abc_name}",
+            "lead_sheet_abc_url": f"{base}/score.abc",
+            "pages_url": f"{base}/pages",
+            "playback_url": f"{base}/playback.json",
+            "staff_mode": staff_mode,
+            "staff_url": f"/piano-staff?session={session}&mode={staff_mode}",
+            "client_url": f"/client?tab=music&session={session}",
+            "has_stems": ((music_dir / "vocals.wav").is_file() and
+                          (music_dir / "instrumental.wav").is_file()),
+            "has_timed_lyrics": bool(lyrics.get("lines")),
+            "lyrics_source": lyrics.get("source"),
+            "midi_files": midi,
+            "piano_wavs": piano,
+            "num_events": result.get("num_events"),
+            "duration_seconds": result.get("duration_seconds"),
+        })
+
+    @app.get("/v1/audio/music/sessions")
+    async def music_sessions(limit: int = 50):
+        """List persisted music sessions, newest first."""
+        def _list() -> list[dict]:
+            items = []
+            for entry in _music_output_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                if not re.fullmatch(r"[0-9a-f]{12}", entry.name):
+                    continue
+                item = _session_list_item(entry)
+                if item is not None:
+                    items.append(item)
+            items.sort(key=lambda item: item.get("updated_at") or "",
+                       reverse=True)
+            return items[:max(1, min(int(limit or 50), 200))]
+
+        return JSONResponse({
+            "root": str(_music_output_dir),
+            "sessions": await asyncio.to_thread(_list),
+        })
 
     @app.get("/v1/audio/music/score/{session}/pages")
     async def music_score_pages(session: str):
@@ -1050,11 +1381,25 @@ def create_app(
         demucs separation + ASR on the vocal stem.
         """
         music_dir = _music_output_dir / session
-        audio_files = ([f for f in music_dir.iterdir()
-                        if f.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg", ".m4a")]
+        audio_files = (_original_audio_files(music_dir)
                        if music_dir.exists() else [])
         if not audio_files:
             raise HTTPException(404, f"Session {session} not found")
+        # Precomputed timed lyrics are ready immediately, but still run
+        # separation if the vocal/instrumental stems do not exist yet.
+        lyrics_path = music_dir / "lyrics.json"
+        has_stems = ((music_dir / "vocals.wav").is_file() and
+                     (music_dir / "instrumental.wav").is_file())
+        if lyrics_path.exists():
+            try:
+                data = json.loads(lyrics_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            if (data.get("lines") or data.get("status") == "done") and has_stems:
+                return JSONResponse({
+                    "status": "ready",
+                    "source": data.get("source", "precomputed"),
+                })
         if session in _lyrics_jobs:
             return JSONResponse({"status": "running"})
         _lyrics_jobs.add(session)
@@ -1069,6 +1414,58 @@ def create_app(
             return JSONResponse({"status": "idle"})
         return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
 
+    @app.post("/v1/audio/music/lyrics/{session}/lrc")
+    async def music_lyrics_lrc(session: str, file: UploadFile = File(...)):
+        """Attach a user-supplied LRC timeline to an existing session."""
+        music_dir = _music_output_dir / session
+        if not music_dir.exists():
+            raise HTTPException(404, f"Session {session} not found")
+        text = (await file.read()).decode("utf-8", errors="replace")
+        lines = []
+        for raw in text.splitlines():
+            match = re.match(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$", raw.strip())
+            if not match:
+                continue
+            start = int(match.group(1)) * 60 + float(match.group(2))
+            content = match.group(3).strip()
+            if content:
+                lines.append({"start": round(start, 3), "text": content})
+        if not lines:
+            raise HTTPException(400, "No [mm:ss.xx] timestamps found in LRC")
+        duration = None
+        result_path = music_dir / "result.json"
+        if result_path.exists():
+            try:
+                duration = float(json.loads(
+                    result_path.read_text(encoding="utf-8")).get("duration_seconds") or 0)
+            except Exception:
+                duration = None
+        if not duration:
+            duration = max(line["start"] for line in lines) + 10.0
+        for index, line in enumerate(lines):
+            end = lines[index + 1]["start"] if index + 1 < len(lines) else duration
+            line["end"] = round(min(end, duration), 3)
+        payload = {
+            "status": "done",
+            "source": "lrc",
+            "lines": lines,
+            "lyrics": "\n".join(line["text"] for line in lines),
+        }
+        # Keep the separated stems visible after attaching a user LRC.
+        lyrics_path = music_dir / "lyrics.json"
+        if lyrics_path.exists():
+            try:
+                previous = json.loads(lyrics_path.read_text(encoding="utf-8"))
+            except Exception:
+                previous = {}
+            for key in ("vocals_url", "instrumental_url", "model",
+                        "separation_seconds"):
+                if previous.get(key) is not None:
+                    payload[key] = previous[key]
+        lyrics_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        return JSONResponse(payload)
+
     def _lyrics_job(session: str, audio_path: Path) -> None:
         out = _music_output_dir / session / "lyrics.json"
 
@@ -1076,22 +1473,71 @@ def create_app(
             out.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                            encoding="utf-8")
 
+        session_dir = _music_output_dir / session
+        base = f"/v1/audio/music/score/{session}"
+        previous = {}
+        if out.exists():
+            try:
+                previous = json.loads(out.read_text(encoding="utf-8"))
+            except Exception:
+                previous = {}
+        preserved = {}
+        if previous.get("lines"):
+            preserved["lines"] = previous["lines"]
+            preserved["source"] = previous.get("source", "precomputed")
+        preserved_lyrics = previous.get("lyrics") or ""
         t0 = time.monotonic()
         try:
-            write({"status": "separating"})
+            write({"status": "separating", **preserved})
             separate = _load_separate_fn()
-            vocals, _instrumental = separate(audio_path, _music_output_dir / session,
-                                             device="cuda")
+            vocals, instrumental = separate(audio_path, session_dir,
+                                            device="cuda")
             separation_s = time.monotonic() - t0
-            write({"status": "transcribing",
-                   "separation_seconds": round(separation_s, 1)})
+            model_file = session_dir / "vocals.model"
+            model = (model_file.read_text(encoding="utf-8").strip()
+                     if model_file.exists() else "demucs")
+            stems = {
+                "model": model,
+                "vocals_url": f"{base}/{vocals.name}",
+                "instrumental_url": f"{base}/{instrumental.name}",
+                "separation_seconds": round(separation_s, 1),
+                **preserved,
+            }
+            write({"status": "transcribing", **stems})
+            if vx is None:
+                # Music-only deployments intentionally do not load the ASR
+                # checkpoint.  The vocal stem is still the useful result.
+                write({
+                    "status": "done", "lyrics": preserved_lyrics,
+                    "stems_only": True,
+                    "note": "ASR model is not loaded; vocal stem ready. "
+                            "Upload an LRC file for timed lyrics.",
+                    **stems,
+                    "total_seconds": round(time.monotonic() - t0, 1),
+                })
+                return
             t1 = time.monotonic()
-            text = _asr_vocals(vocals)
+            try:
+                text = _asr_vocals(vocals)
+            except Exception as exc:  # keep the separated stems
+                write({
+                    "status": "done", "lyrics": preserved_lyrics,
+                    "stems_only": True,
+                    "asr_error": f"{type(exc).__name__}: {exc}",
+                    **stems,
+                    "total_seconds": round(time.monotonic() - t0, 1),
+                })
+                return
             asr_s = time.monotonic() - t1
-            write({"status": "done", "lyrics": text,
-                   "separation_seconds": round(separation_s, 1),
+            write({"status": "done",
+                   "lyrics": preserved_lyrics or text, **stems,
                    "asr_seconds": round(asr_s, 1),
                    "total_seconds": round(time.monotonic() - t0, 1)})
+        except ModuleNotFoundError as exc:  # optional demucs/ASR dependencies
+            write({"status": "unavailable",
+                   "error": f"Lyrics alignment is unavailable: {exc.name}. "
+                            "Upload an LRC file to enable timed lyrics.",
+                   "missing": exc.name})
         except Exception as exc:  # noqa: BLE001 — surfaced to the client
             write({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
         finally:
@@ -1150,13 +1596,17 @@ def create_app(
     @app.get("/v1/audio/music/score/{session}/{filename}")
     async def music_score_file(session: str, filename: str):
         """Serve SVG/PNG/MIDI/WAV files from the music output directory."""
-        safe = _safe_filename(filename)
-        path = _music_output_dir / session / safe
-        if not path.exists() and safe in ("transcription.mid", "chords.mid",
-                                          "playback.json"):
-            await asyncio.to_thread(_ensure_playback_bundle,
-                                    _music_output_dir / session)
-        if not path.exists():
+        # Keep the original basename (spaces/unicode included); only strip
+        # directory components. Path containment prevents traversal.
+        name = Path(filename).name
+        root = (_music_output_dir / session).resolve()
+        path = (root / name).resolve()
+        if root not in path.parents or path == root:
+            raise HTTPException(404, "File not found")
+        if not path.is_file() and name in ("transcription.mid", "chords.mid",
+                                           "playback.json"):
+            await asyncio.to_thread(_ensure_playback_bundle, root)
+        if not path.is_file():
             raise HTTPException(404, "File not found")
         media = {
             ".svg": "image/svg+xml", ".png": "image/png",
@@ -1167,6 +1617,186 @@ def create_app(
         }
         ext = path.suffix.lower()
         return FileResponse(path, media_type=media.get(ext, "application/octet-stream"))
+
+    @app.get("/piano-staff", include_in_schema=False, response_class=HTMLResponse)
+    async def piano_staff() -> HTMLResponse:
+        page = Path(__file__).parent / "templates" / "piano_staff.html"
+        return HTMLResponse(page.read_text(encoding="utf-8"))
+
+    def _staff_payload(session: str, mode: str) -> dict:
+        from veloxvoice.audio.piano_engine import (
+            build_sheet_staff, rebuild_piano_staff, session_duration)
+
+        music_dir = _music_output_dir / session
+        if not music_dir.exists():
+            raise HTTPException(404, f"Session {session} not found")
+        if mode not in ("a", "b", "sheet"):
+            raise HTTPException(404, "mode must be a, b or sheet")
+
+        duration = session_duration(music_dir)
+        metrics = {}
+        if mode == "sheet":
+            meta = build_sheet_staff(music_dir)
+            abc_path = music_dir / "sheet_staff.abc"
+            audio_mode = "sheet"
+        else:
+            if not (music_dir / "piano_A_notes.json").exists():
+                raise HTTPException(
+                    404, f"Piano artifacts for mode {mode} not found")
+            upper = mode.upper()
+            meta_path = music_dir / f"piano_{upper}_staff_events.json"
+            meta = {}
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    meta = {}
+            if int(meta.get("version") or 0) < 7:
+                meta = rebuild_piano_staff(music_dir, upper)
+            abc_path = music_dir / f"piano_{upper}_staff.abc"
+            audio_mode = mode
+            metrics_path = music_dir / "piano_metrics.json"
+            if metrics_path.exists():
+                try:
+                    metrics = json.loads(
+                        metrics_path.read_text(encoding="utf-8"))
+                except Exception:
+                    metrics = {}
+
+        if not abc_path.exists():
+            raise HTTPException(404, f"Staff artifacts for mode {mode} not found")
+        return {
+            "session": session,
+            "mode": mode,
+            "duration": meta.get("duration", duration),
+            "tempo": meta.get("tempo"),
+            "meter": meta.get("meter"),
+            "key": meta.get("key"),
+            "bars": meta.get("bars"),
+            "bar_seconds": meta.get("bar_seconds"),
+            "measures": meta.get("measures", []),
+            "bass_details": meta.get("bass_details", []),
+            "abc": abc_path.read_text(encoding="utf-8"),
+            "parts": meta.get("parts", []),
+            "audio_url": f"/piano-view/audio/{audio_mode}?session={session}",
+            "metrics": metrics,
+        }
+
+    @app.get("/piano-staff/data")
+    async def piano_staff_data(session: str = "e58dd3f11a2f", mode: str = "a"):
+        return JSONResponse(await asyncio.to_thread(_staff_payload, session, mode))
+
+    @app.get("/piano-view", include_in_schema=False, response_class=HTMLResponse)
+    async def piano_view() -> HTMLResponse:
+        page = Path(__file__).parent / "templates" / "piano_view.html"
+        return HTMLResponse(page.read_text(encoding="utf-8"))
+
+    @app.get("/piano-view/data/{mode}")
+    async def piano_view_data(mode: str, session: str = "e58dd3f11a2f"):
+        music_dir = _music_output_dir / session
+        if not music_dir.exists():
+            raise HTTPException(404, f"Session {session} not found")
+        metrics_path = music_dir / "piano_metrics.json"
+        metrics = (json.loads(metrics_path.read_text(encoding="utf-8"))
+                   if metrics_path.exists() else {})
+        from veloxvoice.audio.piano_engine import session_duration
+        if mode == "a":
+            raw = json.loads((music_dir / "piano_A_notes.json").read_text(
+                encoding="utf-8"))
+            notes = [{
+                "pitch": int(n.get("midi_note", n.get("pitch"))),
+                "start": float(n.get("onset_time", n.get("start"))),
+                "end": float(n.get("offset_time", n.get("end"))),
+                "velocity": int(n.get("velocity", 70)),
+            } for n in raw]
+            notes.sort(key=lambda n: n["start"])
+            tracks = [
+                {"name": "RH", "notes": [n for n in notes if n["pitch"] >= 60]},
+                {"name": "LH", "notes": [n for n in notes if 48 <= n["pitch"] < 60]},
+                {"name": "Bass", "notes": [n for n in notes if n["pitch"] < 48]},
+            ]
+        elif mode == "b":
+            data = json.loads((music_dir / "piano_B_notes.json").read_text(
+                encoding="utf-8"))
+            tracks = data.get("tracks", [])
+            notes = [n for t in tracks for n in t.get("notes", [])]
+        else:
+            raise HTTPException(404, "mode must be a or b")
+        return JSONResponse({
+            "session": session,
+            "mode": mode,
+            "duration": session_duration(music_dir),
+            "tracks": tracks,
+            "audio_url": f"/piano-view/audio/{mode}?session={session}",
+            "metrics": metrics,
+        })
+
+    @app.get("/piano-view/audio/{mode}")
+    async def piano_view_audio(mode: str, session: str = "e58dd3f11a2f"):
+        music_dir = _music_output_dir / session
+        if not music_dir.exists():
+            raise HTTPException(404, f"Session {session} not found")
+        if mode == "b":
+            target = music_dir / "piano_B.wav"
+            if not target.is_file():
+                raise HTTPException(404, "B render not found")
+            return FileResponse(target, media_type="audio/wav")
+        if mode in ("a", "sheet"):
+            audio_files = _original_audio_files(music_dir)
+            if not audio_files:
+                if mode == "a" and (music_dir / "piano_A_synth.wav").is_file():
+                    audio_files = [music_dir / "piano_A_synth.wav"]
+                else:
+                    raise HTTPException(404, "No audio file in session")
+            audio = audio_files[0]
+            mime = {".mp3": "audio/mpeg", ".wav": "audio/wav",
+                    ".flac": "audio/flac", ".ogg": "audio/ogg",
+                    ".m4a": "audio/mp4"}.get(audio.suffix.lower(),
+                                             "application/octet-stream")
+            return FileResponse(audio, media_type=mime)
+        raise HTTPException(404, "mode must be a, b or sheet")
+
+    @app.get("/score-demo", include_in_schema=False, response_class=HTMLResponse)
+    async def score_demo() -> HTMLResponse:
+        page = Path(__file__).parent / "templates" / "score_demo.html"
+        return HTMLResponse(page.read_text(encoding="utf-8"))
+
+    @app.get("/score-demo/data")
+    async def score_demo_data() -> JSONResponse:
+        base = Path(__file__).parent / "templates" / "score_demo"
+        return JSONResponse({
+            "abc": (base / "theme.abc").read_text(encoding="utf-8"),
+            "playback": json.loads((base / "playback.json").read_text(encoding="utf-8")),
+            "audio_url": "/score-demo/audio",
+        })
+
+    @app.get("/score-demo/audio")
+    async def score_demo_audio() -> FileResponse:
+        base = Path(__file__).parent / "templates" / "score_demo"
+        return FileResponse(base / "theme_loop.wav", media_type="audio/wav")
+
+    @app.get("/score-demo/abcjs.js")
+    async def score_demo_abcjs() -> FileResponse:
+        path = (Path(__file__).resolve().parents[2] / "render_assets"
+                / "abcjs-basic-min.js")
+        return FileResponse(path, media_type="application/javascript")
+
+    @app.get("/i18n.js", include_in_schema=False)
+    async def i18n_script() -> FileResponse:
+        path = Path(__file__).parent / "templates" / "i18n.js"
+        return FileResponse(path, media_type="application/javascript")
+
+    @app.get("/i18n/{lang}.md", include_in_schema=False)
+    async def i18n_markdown(lang: str) -> FileResponse:
+        lang = lang.lower()
+        if lang == "zh":
+            lang = "cn"
+        if lang not in ("en", "cn"):
+            raise HTTPException(404, "unknown language")
+        path = Path(__file__).parent / "templates" / "i18n" / f"{lang}.md"
+        if not path.is_file():
+            raise HTTPException(404, "language file not found")
+        return FileResponse(path, media_type="text/markdown; charset=utf-8")
 
     @app.get("/client", include_in_schema=False, response_class=HTMLResponse)
     async def client() -> HTMLResponse:
@@ -1208,15 +1838,23 @@ def create_app(
         routes = {
             "health": "/health",
             "models": "/v1/models",
+            "demo": "/",
             "client": "/client",
-            "transcriptions": "/v1/audio/transcriptions",
         }
+        if _has_asr:
+            routes["transcriptions"] = "/v1/audio/transcriptions"
         if has_music:
             routes["music_transcriptions"] = "/v1/audio/music/transcriptions"
+        if is_music or vx is None:
+            model_type = "music"
+        elif has_music:
+            model_type = "asr+music"
+        else:
+            model_type = "asr"
         return JSONResponse(
             {
                 "name": "VeloxVoice",
-                "model_type": "asr+music" if has_music else "asr",
+                "model_type": model_type,
                 "routes": routes,
                 "docs": "/docs",
                 "openapi": "/openapi.json",
