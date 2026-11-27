@@ -54,17 +54,29 @@ This restul fundamental changed the streaming logics of previous audio tasks, wh
 | multi worker, 1-h audio     | Hopper superPod  | **997 ms** | **0.0003** |
 
 
-**New ASR for Music**
+<h2 id="new-asr">🎹 New ASR : Audio Symbol Recognition</h2>
+
+**New ASR for Music notes in multiple tracks**
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/54a7868a-5fe7-42a3-85b8-824c94f6c8f8" width="60%"> </video>
 </div>
 
-Traditional ASR transcribe audio with vocals merely into text. In an music the text can be lyrics, music notes and they can span in different tracks as their pitches vary.
+Traditional ASR transcribe audio with vocals merely into text. For a piece of melody with vocals, the text can be lyrics, music notes and they can span in different tracks as their pitches vary.
 
-Introducing the new ASR, we can transcribe music into notes of left hand piano, right hand side piano and underlying bass. Besides after separating vocles from instruments, we can capture the lyrics definitely.
+Introducing the new ASR, we can transcribe music into notes of left hand piano, right hand side piano and underlying bass in **few seconds**. Some optimization we have explored :
 
-For more advantage use, see our free software **VeloxForge** for personal users, powered and hosted by our proprietory computing agent and platforms.
+- built on sheetsage (ss) v2 models, besides reuse the conformer kernels we developed few days ago 
+- we extensively explore sub-megakernel pattern within decoding add K1/K2/K3 splittable piecewise graph acceleration under PDL : 
+
+> in cuda remapping of threads happen essentially in the stage of  kernel launch, a distributed layout
+for one kernel does not mean it is suitable for another since they require distinct computing pattners. 
+
+This finally a low latency decoding for **1600** decoding steps in a music of 5 or 7 minutes length.
+
+With pitch mathing algorithm and SheetSage2, we canseparating vocles from instruments, and capture both the lyrics and notes on multiple tracks definitely.
+
+For more advantage usage, see our free software **VeloxForge** for personal users, powered and hosted by our proprietory computing agent and platforms.
 
 ## Overview
 
