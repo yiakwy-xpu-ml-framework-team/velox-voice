@@ -1,0 +1,14 @@
+# Optional vocal / instrumental stems for the lyrics lane.
+#
+# Demucs v4 fine-tuned (htdemucs_ft) is the fast local baseline.  It writes
+# ordinary PCM WAV stems; tools/music/separate_vocals.py saves them with
+# soundfile because recent torchaudio versions route save() through
+# torchcodec (not installed here).
+#
+# Pin 4.0.1: demucs 4.1.x pulls `sphn`, whose aarch64 sdist build needs a
+# Rust toolchain and can hang.  4.0.1 uses torchaudio and is sufficient.
+demucs==4.0.1
+dora-search
+julius>=0.2.3
+lameenc>=1.2
+openunmix

@@ -229,3 +229,7 @@ compile_commands.json
 
 # VSCode
 .vscode
+
+# Persistent music demo sessions (uploaded audio, stems, generated scores)
+output/music_sessions/
+

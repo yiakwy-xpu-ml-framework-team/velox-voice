@@ -2,11 +2,21 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>VeloxVoice ASR Client</title>
+  <title>VeloxVoice Client</title>
+  <script src="/i18n.js"></script>
   <style>
     :root { color-scheme: light dark; }
     body { font: 15px/1.5 system-ui,sans-serif; max-width: 900px; margin: 30px auto; }
     h1 { font-size: 22px; margin-bottom: 14px; }
+    .lang-switch { position: fixed; top: 12px; right: 14px; z-index: 120;
+      display: flex; align-items: center; gap: 2px; padding: 3px;
+      background: #fff; border: 1px solid #ddd; border-radius: 999px;
+      box-shadow: 0 2px 12px rgba(15,23,42,.08); font-size: 12px; }
+    .lang-switch button { background: transparent; color: #64748b;
+      border: 0; padding: 4px 9px; border-radius: 999px; font-size: 12px;
+      line-height: 1.2; }
+    .lang-switch button.active { background: #10a37f; color: #fff; }
+    .lang-switch span { color: #cbd5e1; }
     .card { background: #f7f7f8; border-radius: 12px; padding: 18px; }
     .drop { border: 2px dashed #bbb; border-radius: 10px; padding: 22px; text-align: center; cursor: pointer; }
     .drop.drag { border-color: #10a37f; background: #e8f7f2; }
@@ -31,43 +41,47 @@
   </style>
 </head>
 <body>
+  <div class="lang-switch" role="group" aria-label="Language">
+    <button type="button" data-lang-button="en">EN</button><span>/</span><button type="button" data-lang-button="zh">中文</button>
+  </div>
   <div style="display:flex;gap:0;margin-bottom:14px;max-width:900px;margin-left:auto;margin-right:auto;margin-bottom:14px">
-    <button id="tabAsr" onclick="showTab('asr')" style="flex:1;padding:10px;font-size:15px;background:#10a37f;color:#fff;border:1px solid #10a37f;border-radius:8px 0 0 8px;cursor:pointer;font-weight:600">ASR (Vocal)</button>
-    <button id="tabMusic" onclick="showTab('music')" style="flex:1;padding:10px;font-size:15px;background:#e8e8ec;color:#666;border:1px solid #ddd;border-radius:0 8px 8px 0;cursor:pointer">AMR (Audio Melody Recognition) + Vocal</button>
+    <button id="tabAsr" onclick="showTab('asr')" style="flex:1;padding:10px;font-size:15px;background:#10a37f;color:#fff;border:1px solid #10a37f;border-radius:8px 0 0 8px;cursor:pointer;font-weight:600" data-i18n="tab.asr">ASR (Vocal)</button>
+    <button id="tabMusic" onclick="showTab('music')" style="flex:1;padding:10px;font-size:15px;background:#e8e8ec;color:#666;border:1px solid #ddd;border-radius:0 8px 8px 0;cursor:pointer" data-i18n="tab.music">AMR (Audio Melody Recognition) + Vocal</button>
   </div>
   <div id="asrPanel">
-  <h1>VeloxVoice ASR Client</h1>
+  <h1 data-i18n="asr.heading">VeloxVoice ASR Client</h1>
   <div class="card">
     <div class="drop" id="drop">
-      <b>Select audio</b><br>
-      <small>MP3, WAV, FLAC, M4A, OGG, MP4…</small>
+      <b data-i18n="asr.selectAudio">Select audio</b><br>
+      <small data-i18n="asr.formats">MP3, WAV, FLAC, M4A, OGG, MP4…</small>
     </div>
     <input type="file" id="file" accept="audio/*,video/*" />
     <div class="actions">
       <select id="pool">
-        <option value="5" selected>5s pool</option>
-        <option value="10">10s pool</option>
-        <option value="20">20s pool</option>
-        <option value="30">30s pool</option>
+        <option value="5" selected data-i18n="asr.pool" data-i18n-params='{"seconds":5}'>5s pool</option>
+        <option value="10" data-i18n="asr.pool" data-i18n-params='{"seconds":10}'>10s pool</option>
+        <option value="20" data-i18n="asr.pool" data-i18n-params='{"seconds":20}'>20s pool</option>
+        <option value="30" data-i18n="asr.pool" data-i18n-params='{"seconds":30}'>30s pool</option>
       </select>
       <label id="rescoreLabel" title="attention rescoring (slower, slightly more accurate)">
-        <input type="checkbox" id="rescore" /> rescore
+        <input type="checkbox" id="rescore" /> <span data-i18n="asr.rescore">rescore</span>
       </label>
-      <button id="uploadBtn" disabled>Upload</button>
-      <button id="transcribeBtn" disabled>Transcribe (after uploading)</button>
-      <button id="webrtcBtn" class="live" disabled>Transcribing (WebRTC)</button>
+      <button id="uploadBtn" disabled data-i18n="asr.uploadBtn">Upload</button>
+      <button id="transcribeBtn" disabled data-i18n="asr.transcribeBtn">Transcribe (after uploading)</button>
+      <button id="webrtcBtn" class="live" disabled data-i18n="asr.webrtcBtn">Transcribing (WebRTC)</button>
     </div>
 
     <div class="progress"><div id="uploadBar"></div></div>
-    <div class="progress-label"><span id="uploadLabel">Upload</span><span id="uploadStatus">Idle</span></div>
+    <div class="progress-label"><span id="uploadLabel" data-i18n="common.upload">Upload</span><span id="uploadStatus" data-i18n="common.idle">Idle</span></div>
 
     <div class="progress"><div id="asrBar"></div></div>
-    <div class="progress-label"><span id="asrLabel">Transcribing</span><span id="asrStatus">Idle</span></div>
+    <div class="progress-label"><span id="asrLabel" data-i18n="asr.transcribeLabel">Transcribing</span><span id="asrStatus" data-i18n="common.idle">Idle</span></div>
 
-    <pre id="out">Waiting for audio…</pre>
+    <pre id="out" data-i18n="asr.waiting">Waiting for audio…</pre>
     <div class="meta">
-      API docs: <code>/docs</code>. Live streaming: <code>/v1/audio/ws</code>.
-      Live mode emits a short 1s first partial, then uses the selected pool cadence.
+      <span data-i18n="asr.apiDocs">API docs:</span> <code>/docs</code>.
+      <span data-i18n="asr.liveStream">Live streaming:</span> <code>/v1/audio/ws</code>.
+      <span data-i18n="asr.liveHint">Live mode emits a short 1s first partial, then uses the selected pool cadence.</span>
     </div>
   </div>
 <script>
@@ -87,7 +101,54 @@ document.addEventListener('drop', e => e.preventDefault());
 // ── AMR (music transcription) — two-step flow matching ASR ──
 let musicFile = null, musicUploadedId = null, svgPages = [], curPage = 0;
 let musicBusy = false;
+let musicAudioDuration = 0;
+let currentSessionId = null;
 const $m = id => document.getElementById(id);
+const tr = (key, vars) => (window.VeloxI18n
+  ? window.VeloxI18n.t(key, vars) : key);
+const i18nReady = window.VeloxI18n
+  ? window.VeloxI18n.init() : Promise.resolve('zh');
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
+function fmtClock(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return '—';
+  const total = Math.max(0, Math.round(Number(seconds)));
+  return Math.floor(total / 60) + ':' +
+    String(total % 60).padStart(2, '0');
+}
+
+function setCurrentSession(session) {
+  currentSessionId = session || null;
+  const row = $m('sessionIdRow');
+  if (!row) return;
+  if (!currentSessionId) {
+    row.style.display = 'none';
+    return;
+  }
+  row.style.display = 'flex';
+  $m('currentSessionId').textContent = currentSessionId;
+  const url = new URL(location.href);
+  url.searchParams.set('tab', 'music');
+  url.searchParams.set('session', currentSessionId);
+  $m('sessionPermalink').href = url.pathname + url.search;
+  history.replaceState(null, '', url.pathname + url.search);
+}
+
+async function copyCurrentSession() {
+  if (!currentSessionId) return;
+  try {
+    await navigator.clipboard.writeText(currentSessionId);
+    $m('copySession').textContent = tr('common.copied');
+    setTimeout(() => { $m('copySession').textContent = tr('music.copy'); }, 1200);
+  } catch (e) {
+    $m('copySession').textContent = currentSessionId;
+  }
+}
 
 function musicSetProgress(bar, percent) {
   const el = $m(bar);
@@ -102,16 +163,32 @@ function musicSetButtons() {
 function musicResetForFile(file) {
   musicFile = file;
   musicUploadedId = null;
+  currentSessionId = null;
+  const sessionRow = $m('sessionIdRow');
+  if (sessionRow) sessionRow.style.display = 'none';
+  const currentUrl = new URL(location.href);
+  currentUrl.searchParams.delete('session');
+  history.replaceState(null, '', currentUrl.pathname + currentUrl.search);
+  musicAudioDuration = 0;
+  if (file) {
+    const media = document.createElement('audio');
+    media.preload = 'metadata';
+    media.onloadedmetadata = () => {
+      musicAudioDuration = Number.isFinite(media.duration) ? media.duration : 0;
+    };
+    media.src = URL.createObjectURL(file);
+  }
   musicSetProgress('musicUploadBar', 0);
-  $m('musicUploadLabel').textContent = 'Upload';
-  $m('musicUploadStatus').textContent = file ? 'Selected' : 'Idle';
+  $m('musicUploadLabel').textContent = tr('music.uploadLabel');
+  $m('musicUploadStatus').textContent = file ? tr('music.status.selected') : tr('music.idle');
   musicSetProgress('musicDecodeBar', 0);
-  $m('musicDecodeLabel').textContent = 'Transcribing';
-  $m('musicDecodeStatus').textContent = 'Idle';
+  $m('musicDecodeLabel').textContent = tr('music.transcribeLabel');
+  $m('musicDecodeStatus').textContent = tr('music.idle');
   musicSetButtons();
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  await i18nReady;
   $m('musicDrop').addEventListener('click', () => $m('musicFile').click());
   $m('musicDrop').addEventListener('dragover', e => { e.preventDefault(); $m('musicDrop').classList.add('drag'); });
   $m('musicDrop').addEventListener('dragleave', e => $m('musicDrop').classList.remove('drag'));
@@ -125,6 +202,11 @@ document.addEventListener('DOMContentLoaded', () => {
   // bind upload + transcribe buttons
   $m('musicUploadBtn').addEventListener('click', () => musicUploadHandler());
   $m('musicTranscribeBtn').addEventListener('click', () => musicTranscribeHandler());
+  $m('copySession').addEventListener('click', copyCurrentSession);
+  $m('recentRefresh').addEventListener('click', refreshRecentSessions);
+  $m('recentFilter').addEventListener('input', () =>
+    renderRecentSessions(recentSessionsCache));
+  refreshRecentSessions();
 });
 
 // step 1: upload (bound inside DOMContentLoaded below)
@@ -132,9 +214,10 @@ async function musicUploadHandler() {
   if (!musicFile || musicBusy) return;
   musicBusy = true; musicSetButtons();
   musicSetProgress('musicUploadBar', 0);
-  $m('musicUploadStatus').textContent = 'Uploading…';
+  $m('musicUploadStatus').textContent = tr('music.status.uploading');
   const fd = new FormData(); fd.append('file', musicFile);
   const startedAt = performance.now();
+  let uploadEndedAt = 0;
   try {
     const uploaded = await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -143,26 +226,50 @@ async function musicUploadHandler() {
         if (!ev.lengthComputable) return;
         const pct = 100 * ev.loaded / ev.total;
         musicSetProgress('musicUploadBar', pct);
-        $m('musicUploadStatus').textContent = 'Uploading ' + Math.round(pct) + '%';
+        $m('musicUploadStatus').textContent =
+          tr('music.status.uploadingPct', {pct: Math.round(pct)});
+      };
+      xhr.upload.onloadend = () => {
+        uploadEndedAt = performance.now();
+        musicSetProgress('musicUploadBar', 100);
+        $m('musicUploadStatus').textContent = tr('music.status.saving');
       };
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve(JSON.parse(xhr.responseText));
         } else {
-          reject(new Error('Upload failed (HTTP ' + xhr.status + ')'));
+          reject(new Error(tr('music.status.uploadFailedHttp',
+            {status: xhr.status})));
         }
       };
-      xhr.onerror = () => reject(new Error('Upload network error'));
+      xhr.onerror = () => reject(
+        new Error(tr('music.status.uploadNetworkError')));
       xhr.send(fd);
     });
-    musicUploadedId = uploaded.upload_id;
+    const responseAt = performance.now();
+    const uploadSeconds = ((uploadEndedAt || responseAt) - startedAt) / 1000;
+    const serverSeconds = (responseAt - (uploadEndedAt || startedAt)) / 1000;
+    musicUploadedId = uploaded.upload_id || uploaded.id || null;
+    if (!musicUploadedId) throw new Error(tr('music.status.uploadMissingId'));
+    setCurrentSession(uploaded.session || musicUploadedId);
+    musicBusy = false;          // upload is done; allow Transcribe immediately
+    musicSetButtons();
     musicSetProgress('musicUploadBar', 100);
-    const elapsed = ((performance.now() - startedAt) / 1000).toFixed(2);
-    $m('musicUploadLabel').textContent = 'Upload';
-    $m('musicUploadStatus').textContent = 'Uploaded in ' + elapsed + ' s';
+    $m('musicUploadLabel').textContent = tr('music.uploadLabel');
+    $m('musicUploadStatus').textContent = uploaded.reused
+      ? tr('music.status.reused', {session: currentSessionId})
+      : (tr('music.status.uploaded', {seconds: uploadSeconds.toFixed(2)}) +
+         (serverSeconds >= 0.2
+           ? ' ' + tr('music.status.serverTime',
+             {seconds: serverSeconds.toFixed(2)}) : ''));
+    refreshRecentSessions();
   } catch (e) {
+    musicUploadedId = null;
+    musicBusy = false;
+    musicSetButtons();
     musicSetProgress('musicUploadBar', 0);
-    $m('musicUploadStatus').textContent = 'Upload failed: ' + e.message;
+    $m('musicUploadStatus').textContent =
+      tr('music.status.uploadFailed', {error: e.message});
   }
   musicBusy = false; musicSetButtons();
 }
@@ -170,38 +277,60 @@ async function musicUploadHandler() {
 // step 2: transcribe
 async function musicTranscribeHandler() {
   if (!musicUploadedId || musicBusy) return;
+  const engine = $m('musicEngine') ? $m('musicEngine').value : 'sheetsage';
   musicBusy = true; musicSetButtons();
   musicSetProgress('musicDecodeBar', 0);
-  $m('musicDecodeLabel').textContent = 'Transcribing';
+  const decodeBar = $m('musicDecodeBar');
+  decodeBar.classList.add('timed');
+  $m('musicDecodeLabel').textContent = tr('music.transcribeLabel');
   const status = $m('musicStatus');
-  status.textContent = 'Transcribing…';
+  status.textContent = tr('music.status.transcribing');
   status.className = 'status info';
   status.style.display = 'block';
-  // indeterminate progress bar + elapsed time ticker (server takes ~3s)
+  // Time-based progress: the server does not stream progress, so estimate the
+  // total from the audio duration. Piano A/B runs SheetSage2 + CRNN + render,
+  // hence a larger factor than the SheetSage2-only lane.
   const decodeStart = performance.now();
+  const estimated = Math.max(1.2, (musicAudioDuration || 60) *
+    (engine === 'piano' ? 0.11 : 0.02));
   const decodeTicker = setInterval(() => {
-    const elapsed = ((performance.now() - decodeStart) / 1000).toFixed(1);
-    $m('musicDecodeStatus').textContent = 'Transcribing… ' + elapsed + ' s';
-    // simulate progress: 5% per second, capped at 90%
-    const pct = Math.min(90, 5 * parseFloat(elapsed));
+    const elapsed = (performance.now() - decodeStart) / 1000;
+    const pct = Math.min(95, 100 * elapsed / estimated);
     musicSetProgress('musicDecodeBar', pct);
-  }, 200);
+    $m('musicDecodeStatus').textContent =
+      tr('music.status.progress',
+        {elapsed: elapsed.toFixed(1), estimated: estimated.toFixed(1)});
+  }, 100);
   const startedAt = performance.now();
   const form = new FormData();
   form.append('upload_id', musicUploadedId);
+  form.append('engine', engine);
   try {
     const r = await fetch('/v1/audio/music/transcriptions', { method: 'POST', body: form });
     if (!r.ok) { const e = await r.json(); throw new Error(e.detail || r.statusText); }
     const d = await r.json();
     clearInterval(decodeTicker);
+    decodeBar.classList.remove('timed');
     musicSetProgress('musicDecodeBar', 100);
-    const wall = ((performance.now() - startedAt) / 1000).toFixed(2);
-    $m('musicDecodeLabel').textContent = 'Transcribed';
-    $m('musicDecodeStatus').textContent = 'Done in ' + wall + ' s';
-    status.textContent = '✓ ' + d.num_events + ' events, ' + d.abc_measures + ' measures';
-    status.className = 'status ok';
-    // timing
     const p = d.processing || {};
+    const session = d.session || (d.output_dir || '').split('/').pop();
+    const wall = ((performance.now() - startedAt) / 1000).toFixed(2);
+    const pianoMode = d.staff_mode === 'a' || d.staff_mode === 'b';
+    $m('musicDecodeLabel').textContent = pianoMode
+      ? tr('music.status.pianoDone') : tr('music.status.transcribed');
+    $m('musicDecodeStatus').textContent =
+      tr('music.status.done', {seconds: wall}) +
+      (p.wall_time_seconds !== undefined
+        ? ' ' + tr('music.status.serverTime',
+          {seconds: p.wall_time_seconds}) : '');
+    status.className = 'status ok';
+    status.textContent = pianoMode
+      ? tr('music.status.pianoReady')
+      : tr('music.status.sheetReady', {
+        events: d.num_events || 0,
+        measures: d.abc_measures || 0,
+      });
+    // timing
     $m('musicTiming').style.display = 'block';
     $m('tWall').textContent = (p.wall_time_seconds || 0) + ' s';
     $m('tAudio').textContent = (p.audio_duration_seconds || 0) + ' s';
@@ -209,33 +338,40 @@ async function musicTranscribeHandler() {
     $m('tTokens').textContent = p.num_tokens || 0;
     $m('tWindows').textContent = p.num_windows || 1;
     $m('tEvents').textContent = d.num_events || 0;
-    // score
-    const session = d.session || (d.output_dir || '').split('/').pop();
-    if (d.svg_pages && d.svg_pages.length) {
+    // score: the Reaper-style staff replaces the old A4 page area in place
+    if (d.staff_url && session) {
+      embedStaff(session, d.staff_mode || (pianoMode ? 'a' : 'sheet'));
+    } else if (d.svg_pages && d.svg_pages.length) {
       svgPages = d.svg_pages; finishScoreSetup();
     } else if (session && d.pages_list_url) {
       // lazy render: fetch the page list in the background; ABC/MIDI/lyrics
       // are already usable while the (multi-second) render runs
       $m('scoreCard').style.display = 'block';
-      $m('pageLabel').textContent = 'Rendering score…';
-      fetch(d.pages_list_url).then(r => r.ok ? r.json() : null).then(p => {
-        svgPages = (p && p.svg_pages) || [];
+      $m('pageLabel').textContent = tr('music.status.renderingScore');
+      fetch(d.pages_list_url).then(r => r.ok ? r.json() : null).then(pages => {
+        svgPages = (pages && pages.svg_pages) || [];
         if (svgPages.length) finishScoreSetup();
-        else $m('pageLabel').textContent = 'Score unavailable';
-      }).catch(() => { $m('pageLabel').textContent = 'Score unavailable'; });
+        else $m('pageLabel').textContent = tr('music.status.scoreUnavailable');
+      }).catch(() => { $m('pageLabel').textContent = tr('music.status.scoreUnavailable'); });
     }
     if (d.abc) { $m('abcView').style.display = 'block'; $m('abcText').textContent = d.abc; }
-    // score-following player on the uploaded original audio
-    if (d.audio_url) musicSetPlayer(session, d.audio_url);
+    // When the staff is embedded it owns its audio element; otherwise keep
+    // the legacy score-following player on the uploaded original audio.
+    if (!d.staff_url && d.audio_url) musicSetPlayer(session, d.audio_url);
     buildDownloads(d);
     // lyrics lane (demucs + ASR on the vocal stem) — out-of-band, not
     // counted in transcribe time
-    if (d.session) startLyrics(d.session);
+    if (session) {
+      setCurrentSession(session);
+      startLyrics(session);
+    }
+    refreshRecentSessions();
   } catch (e) {
     clearInterval(decodeTicker);
+    decodeBar.classList.remove('timed');
     musicSetProgress('musicDecodeBar', 0);
-    $m('musicDecodeStatus').textContent = 'Failed';
-    status.textContent = 'Error: ' + e.message;
+    $m('musicDecodeStatus').textContent = tr('music.status.failed');
+    status.textContent = tr('music.status.error', {error: e.message});
     status.className = 'status err';
   }
   musicBusy = false; musicSetButtons();
@@ -254,7 +390,9 @@ async function showPage(i, ev) {
   curPage = i;
   const viewer = $m('scoreViewer');
   const scrollTop = viewer.scrollTop;
-  $m('pageLabel').textContent = 'Page ' + (i + 1) + ' / ' + svgPages.length;
+  $m('pageLabel').textContent = tr('music.page', {
+    page: i + 1, total: svgPages.length,
+  });
   $m('prevBtn').disabled = i <= 0;
   $m('nextBtn').disabled = i >= svgPages.length - 1;
   const pg = svgPages[i];
@@ -286,12 +424,16 @@ function buildDownloads(d) {
     ' style="height:28px;max-width:190px"></audio>' : '';
   const dl = u => u ? '<a href="' + u + '" download>&#8595;</a>' : '';
   $m('pianoRow').innerHTML =
-    '<span class="dl-label">&#127929; Piano Mix</span>' + audio(piano.mix) + dl(piano.mix) +
-    '<button type="button" id="pianoExpand" title="Show vocal / instrumental">&#9662;</button>';
+    '<span class="dl-label">' + escapeHtml(tr('music.download.pianoMix')) + '</span>' +
+    audio(piano.mix) + dl(piano.mix) +
+    '<button type="button" id="pianoExpand" title="' +
+    escapeHtml(tr('music.showVocalInstrumental')) + '">&#9662;</button>';
   $m('pianoVocalRow').innerHTML =
-    '<span class="dl-label sub">&#127929; Piano Vocal</span>' + audio(piano.vocal) + dl(piano.vocal);
+    '<span class="dl-label sub">' + escapeHtml(tr('music.download.pianoVocal')) +
+    '</span>' + audio(piano.vocal) + dl(piano.vocal);
   $m('pianoInsRow').innerHTML =
-    '<span class="dl-label sub">&#127929; Piano Instrumental</span>' + audio(piano.instrumental) + dl(piano.instrumental);
+    '<span class="dl-label sub">' + escapeHtml(tr('music.download.pianoInstrumental')) +
+    '</span>' + audio(piano.instrumental) + dl(piano.instrumental);
   $m('pianoExtra').style.display = 'none';
   $m('pianoExpand').innerHTML = '&#9662;';
   $m('pianoExpand').onclick = () => {
@@ -303,19 +445,89 @@ function buildDownloads(d) {
   let midi = '';
   for (const [k, v] of Object.entries(d.midi_files || {}))
     midi += '<a href="' + v + '">MIDI ' + k + '</a>';
-  if (d.session)
-    midi += '<a href="/v1/audio/music/score/' + d.session + '/score.abc" download="score.abc">ABC</a>';
+  if (d.session) {
+    const abcFile = d.staff_mode === 'a' ? 'piano_A_staff.abc'
+                  : d.staff_mode === 'sheet' ? 'sheet_staff.abc'
+                  : 'score.abc';
+    midi += '<a href="/v1/audio/music/score/' + d.session + '/' + abcFile +
+      '" download="' + abcFile + '">ABC</a>';
+  }
+  if (d.audio_url)
+    midi = '<a href="' + d.audio_url + '" target="_blank" rel="noopener">' +
+      escapeHtml(tr('music.download.openAudio')) + '</a>' + midi;
   $m('midiRow').innerHTML = midi;
 }
 
-// ── lyrics lane (background: demucs separation + ASR on the vocal stem) ──
+// ── lyrics lane (background: demucs + ASR, or precomputed timed lyrics) ──
 let lyricsTimer = null;
+let lyricLines = [], lyricEls = [];
+
+function renderLyricsTimeline(lines) {
+  const box = $m('lyricsTimeline');
+  if (!box) return;
+  box.innerHTML = '';
+  lyricEls = [];
+  for (const line of lines) {
+    const el = document.createElement('div');
+    el.className = 'lyric-line';
+    el.textContent = line.text || '';
+    box.appendChild(el);
+    lyricEls.push(el);
+  }
+  box.style.display = lyricEls.length ? 'block' : 'none';
+}
+
+function syncLyrics(timeOverride) {
+  if (!lyricEls.length) return;
+  const audio = $m('songAudio');
+  const t = Number.isFinite(timeOverride) ? timeOverride :
+    (audio ? audio.currentTime : 0);
+  let active = -1;
+  for (let i = 0; i < lyricLines.length; i++) {
+    if (t >= lyricLines[i].start && t < lyricLines[i].end) { active = i; break; }
+    if (t >= lyricLines[i].start) active = i;
+  }
+  let changed = false;
+  lyricEls.forEach((el, i) => {
+    const isActive = i === active;
+    if (el.classList.contains('active') !== isActive) changed = true;
+    el.classList.toggle('active', isActive);
+    el.classList.toggle('past', i < active);
+  });
+  if (changed && active >= 0 && lyricEls[active]) {
+    lyricEls[active].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function renderStemLinks(s) {
+  const row = $m('stemRow');
+  if (!row) return;
+  if (!s || (!s.vocals_url && !s.instrumental_url)) {
+    row.innerHTML = '';
+    row.style.display = 'none';
+    return;
+  }
+  const add = (label, url) => {
+    if (!url) return '';
+    return '<span class="dl-label">' + label + '</span>' +
+      '<audio controls preload="none" src="' + url +
+      '" style="height:28px;max-width:190px"></audio>' +
+      '<a href="' + url + '" download>&#8595;</a>';
+  };
+  const html = add(tr('music.download.vocals'), s.vocals_url) +
+               add(tr('music.download.instrumental'), s.instrumental_url);
+  row.innerHTML = html;
+  row.style.display = html ? 'flex' : 'none';
+}
+
 function startLyrics(session) {
   clearInterval(lyricsTimer);
   $m('lyricsCard').style.display = 'block';
-  $m('lyricsStatus').textContent = 'Separating vocals (demucs)…';
+  $m('lyricsStatus').textContent = tr('music.status.separating');
   $m('lyricsStatus').className = 'status info';
   $m('lyricsText').textContent = '';
+  $m('lyricsSource').style.display = 'none';
+  renderStemLinks(null);
   const form = new FormData(); form.append('session', session);
   fetch('/v1/audio/music/lyrics', { method: 'POST', body: form })
     .then(r => r.json())
@@ -325,29 +537,115 @@ function startLyrics(session) {
           const s = await (await fetch('/v1/audio/music/lyrics/' + session)).json();
           if (s.status === 'done') {
             clearInterval(lyricsTimer);
-            $m('lyricsStatus').className = 'status ok';
-            $m('lyricsStatus').textContent = '&#10003; Lyrics — separation ' +
-              s.separation_seconds + ' s + ASR ' + s.asr_seconds +
-              ' s (background, not in transcribe time)';
+            renderStemLinks(s);
+            const timed = Array.isArray(s.lines) && s.lines.length;
+            if (timed) {
+              lyricLines = s.lines;
+              renderLyricsTimeline(lyricLines);
+              $m('lyricsCard').style.display = 'none';
+              $m('lyricsStatus').className = 'status ok';
+              $m('lyricsStatus').textContent =
+                tr('music.status.timedLyrics', {source: s.source || 'precomputed'});
+              const source = s.source || 'precomputed';
+              $m('lyricsSource').style.display = 'block';
+              $m('lyricsSource').textContent = source === 'lrc'
+                ? tr('music.status.lyricsSourceLrc')
+                : (source === 'lrclib'
+                  ? tr('music.status.lyricsSourceLrclib')
+                  : tr('music.status.lyricsSource', {source}));
+            } else if (s.stems_only) {
+              $m('lyricsStatus').className = 'status ok';
+              $m('lyricsStatus').textContent =
+                tr('music.status.stemsOnly', {
+                  model: s.model || 'demucs',
+                  seconds: s.separation_seconds || 0,
+                });
+            } else {
+              $m('lyricsStatus').className = 'status ok';
+              $m('lyricsStatus').textContent =
+                tr('music.status.separationAsr', {
+                  separation: s.separation_seconds,
+                  asr: s.asr_seconds || 0,
+                });
+            }
             $m('lyricsStatus').innerHTML = $m('lyricsStatus').textContent;
-            $m('lyricsText').textContent = s.lyrics || '(empty)';
+            $m('lyricsText').textContent = s.lyrics ||
+              (timed ? s.lines.map(l => l.text).join('\n') :
+               tr('music.status.noAsrText'));
+          } else if (s.status === 'unavailable') {
+            renderStemLinks(null);
+            clearInterval(lyricsTimer);
+            $m('lyricsStatus').className = 'status info';
+            $m('lyricsStatus').textContent =
+              tr('music.status.timelineUnavailable', {error: s.error || ''});
           } else if (s.status === 'error') {
             clearInterval(lyricsTimer);
             $m('lyricsStatus').className = 'status err';
-            $m('lyricsStatus').textContent = 'Lyrics failed: ' + s.error;
+            $m('lyricsStatus').textContent =
+              tr('music.status.lyricsFailed', {error: s.error});
           } else if (s.status === 'transcribing') {
-            $m('lyricsStatus').textContent = 'Transcribing lyrics (ASR on vocal stem)…';
+            renderStemLinks(s);
+            $m('lyricsStatus').textContent =
+              tr('music.status.asrTranscribing');
           } else if (s.status === 'separating') {
-            $m('lyricsStatus').textContent = 'Separating vocals (demucs)…';
+            $m('lyricsStatus').textContent = tr('music.status.separating');
           }
         } catch (e) { /* keep polling */ }
       }, 2500);
     })
     .catch(e => {
       $m('lyricsStatus').className = 'status err';
-      $m('lyricsStatus').textContent = 'Lyrics lane failed to start: ' + e;
+      $m('lyricsStatus').textContent =
+        tr('music.status.lyricsLaneFailed', {error: e});
     });
 }
+
+// ── user-supplied LRC timeline (no demucs needed) ──
+function bindLrcUpload() {
+  const input = $m('musicLrcFile'), button = $m('musicLrcBtn');
+  if (!input || !button) return;
+  button.onclick = () => {
+    if (!musicSession) {
+      $m('musicLrcStatus').textContent = tr('music.status.lrcFirst');
+      return;
+    }
+    input.click();
+  };
+  input.onchange = async () => {
+    const file = input.files && input.files[0];
+    if (!file || !musicSession) return;
+    $m('musicLrcStatus').textContent = tr('music.status.lrcUploading');
+    const form = new FormData();
+    form.append('file', file);
+    try {
+      const r = await fetch('/v1/audio/music/lyrics/' + musicSession + '/lrc',
+                            {method: 'POST', body: form});
+      if (!r.ok) {
+        const e = await r.json();
+        throw new Error(e.detail || r.statusText);
+      }
+      const s = await r.json();
+      renderStemLinks(s);
+      lyricLines = s.lines || [];
+      renderLyricsTimeline(lyricLines);
+      syncLyrics();
+      $m('lyricsCard').style.display = 'none';
+      $m('lyricsSource').style.display = 'block';
+      $m('lyricsSource').textContent =
+        tr('music.status.lyricsSourceLrc');
+      $m('musicLrcStatus').textContent =
+        tr('music.status.lrcDone', {lines: lyricLines.length});
+    } catch (e) {
+      $m('musicLrcStatus').textContent =
+        tr('music.status.lrcFailed', {error: e.message});
+    }
+    input.value = '';
+  };
+}
+document.addEventListener('DOMContentLoaded', async () => {
+  await i18nReady;
+  bindLrcUpload();
+});
 
 // ── score-following playback ──
 // Notes are matched between playback.json (seconds) and the rendered SVG
@@ -357,12 +655,38 @@ let playbackData = null, pageInfo = null, notesByMeasure = null;
 const EPS_MEASURE = 0.02;
 let musicSession = null;
 
+function musicShowError(message) {
+  const status = $m('musicStatus');
+  status.style.display = 'block';
+  status.className = 'status err';
+  status.textContent = message;
+}
+
 function musicSetPlayer(session, audioUrl) {
   musicSession = session;
   playbackData = pageInfo = notesByMeasure = null;
   activeEls = [];
+  lyricLines = []; lyricEls = [];
+  $m('scoreViewer').classList.remove('staff-embed');
+  $m('lyricsTimeline').style.display = 'none';
+  $m('lyricsSource').style.display = 'none';
   const audio = $m('songAudio');
+  audio.muted = false;
+  audio.volume = 1.0;
   audio.src = audioUrl;
+  audio.load();
+  if (!audio._lyricsSyncBound) {
+    audio._lyricsSyncBound = true;
+    audio.addEventListener('timeupdate', syncLyrics);
+    audio.addEventListener('seeked', syncLyrics);
+  }
+  if (!audio._playbackErrorBound) {
+    audio._playbackErrorBound = true;
+    audio.addEventListener('error', () => {
+      const err = audio.error;
+      musicShowError('Audio load failed' + (err && err.message ? ': ' + err.message : ''));
+    });
+  }
   $m('songPlayer').style.display = 'flex';
   $m('songPlayBtn').innerHTML = '&#9654;';
   fetch('/v1/audio/music/score/' + session + '/playback.json')
@@ -372,6 +696,55 @@ function musicSetPlayer(session, audioUrl) {
       notesByMeasure = buildNotesByMeasure(d);
       applyHighlights();
     });
+}
+
+// ── embedded Reaper-style scrolling staff ──────────────────────────────────
+// The staff replaces the old A4 page area in the score card.  It runs in an
+// iframe so it owns its <audio> element, and posts its playhead time back to
+// this page so the lyrics timeline below stays locked to the same clock.
+let embeddedStaffTime = 0;
+window.addEventListener('message', event => {
+  const message = event.data;
+  if (!message || typeof message !== 'object') return;
+  if (message.type === 'velox-staff-state') {
+    embeddedStaffTime = Number(message.t) || 0;
+    syncLyrics(embeddedStaffTime);
+  } else if (message.type === 'velox-staff-height') {
+    const frame = document.getElementById('staffFrame');
+    if (frame) {
+      frame.style.height = Math.max(
+        360, Math.min(900, Number(message.height) || 0)) + 'px';
+    }
+  }
+});
+
+function embedStaff(session, mode) {
+  const viewer = $m('scoreViewer');
+  musicSession = session;
+  embeddedStaffTime = 0;
+  playbackData = pageInfo = notesByMeasure = null;
+  curSvg = null; activeEls = [];
+  lyricLines = []; lyricEls = [];
+  $m('lyricsTimeline').style.display = 'none';
+  $m('lyricsSource').style.display = 'none';
+  $m('scoreCard').style.display = 'block';
+  $m('scoreViewer').classList.add('staff-embed');
+  $m('scoreNav').style.display = 'none';
+  $m('songPlayer').style.display = 'none';
+  const audio = $m('songAudio'); if (audio) audio.pause();
+  const lang = window.VeloxI18n ? window.VeloxI18n.lang : 'zh';
+  const src = '/piano-staff?session=' + encodeURIComponent(session) +
+    '&mode=' + encodeURIComponent(mode) + '&embed=1&lang=' +
+    encodeURIComponent(lang);
+  viewer.innerHTML = '<iframe id="staffFrame" title="' +
+    escapeHtml(tr('music.staffFrameTitle')) + '" ' +
+    'src="' + src + '"></iframe>';
+  const title = $m('scoreTitle');
+  if (title) {
+    title.textContent = mode === 'sheet'
+      ? '\u{1F3B5} SheetSage2'
+      : '\u{1F3B5} Piano A/B';
+  }
 }
 
 // called once the (lazily rendered) score pages are available
@@ -384,6 +757,142 @@ function finishScoreSetup() {
     fetch('/v1/audio/music/score/' + session + '/score_pages.json')
       .then(r => r.ok ? r.json() : null).then(d => { pageInfo = d; });
   }
+}
+
+// Reopen an existing transcription session without re-uploading:
+//   /?tab=music&session=<session-id>
+async function loadSession(session) {
+  const status = $m('musicStatus');
+  musicUploadedId = session;
+  musicSetButtons();
+  try {
+    status.style.display = 'block';
+    status.className = 'status info';
+    status.textContent = tr('music.status.loadingSession', {session});
+    const info = await (await fetch('/v1/audio/music/session/' + session)).json();
+    if (!info.session) throw new Error(info.detail || 'session not found');
+    setCurrentSession(session);
+    const engineSelect = $m('musicEngine');
+    if (engineSelect) {
+      engineSelect.value = info.staff_mode === 'a' || info.staff_mode === 'b'
+        ? 'piano' : 'sheetsage';
+    }
+    $m('scoreCard').style.display = 'block';
+    $m('musicTiming').style.display = 'block';
+    $m('tWall').textContent = '—';
+    $m('tAudio').textContent = (info.duration_seconds || '—') + ' s';
+    $m('tRtf').textContent = '—';
+    $m('tTokens').textContent = '—';
+    $m('tWindows').textContent = '—';
+    $m('tEvents').textContent = info.num_events || '—';
+    const abc = await (await fetch(info.abc_url)).text();
+    if (abc) {
+      $m('abcView').style.display = 'block';
+      $m('abcText').textContent = abc;
+    }
+    if (info.staff_url) {
+      // Reopen with the same one-row multi-lane staff used after transcribe.
+      embedStaff(session, info.staff_mode || 'sheet');
+    } else {
+      // musicSetPlayer must run before finishScoreSetup so musicSession is set.
+      musicSetPlayer(session, info.audio_url);
+      const p = await (await fetch(info.pages_url)).json();
+      svgPages = (p && p.svg_pages) || [];
+      if (svgPages.length) finishScoreSetup();
+      else $m('pageLabel').textContent = tr('music.status.scoreUnavailable');
+    }
+    buildDownloads({session, audio_url: info.audio_url,
+                    staff_mode: info.staff_mode,
+                    midi_files: info.midi_files || {},
+                    piano_wavs: info.piano_wavs || {}});
+    startLyrics(session);
+    status.className = 'status ok';
+    status.textContent = tr('music.status.loadedSession', {
+      session,
+      title: info.title || '',
+    });
+    refreshRecentSessions();
+  } catch (e) {
+    status.className = 'status err';
+    status.textContent = tr('music.status.loadFailed', {error: e.message});
+  }
+}
+
+let recentSessionsCache = [];
+let recentExpanded = false;
+
+function renderRecentSessions(sessions) {
+  const list = $m('recentList');
+  if (!list) return;
+  const query = ($m('recentFilter') && $m('recentFilter').value || '')
+    .trim().toLowerCase();
+  const filtered = query
+    ? sessions.filter(session =>
+        (session.title || '').toLowerCase().includes(query) ||
+        (session.session || '').toLowerCase().includes(query))
+    : sessions;
+  const visible = recentExpanded ? filtered : filtered.slice(0, 10);
+  list.innerHTML = visible.map(session => {
+    const badges = [];
+    if (session.engine === 'piano') badges.push('Piano A/B');
+    else badges.push('SheetSage2');
+    if (session.has_vocal) badges.push(tr('music.recent.vocal'));
+    if (session.has_stems) badges.push(tr('music.recent.stems'));
+    if (session.has_timed_lyrics) {
+      badges.push(tr('music.recent.lyrics',
+        {source: session.lyrics_source || 'timed'}));
+    }
+    const duration = session.duration_seconds
+      ? fmtClock(session.duration_seconds) : '—';
+    return '<button type="button" class="recent-item' +
+      (session.session === currentSessionId ? ' active' : '') +
+      '" data-session="' + escapeHtml(session.session) + '">' +
+      '<span class="recent-title">' + escapeHtml(session.title) +
+      '</span><span class="recent-meta">' +
+      escapeHtml(session.session) + ' · ' + duration + ' · ' +
+      escapeHtml(badges.join(' · ')) + '</span></button>';
+  }).join('');
+  list.querySelectorAll('.recent-item').forEach(button => {
+    button.onclick = () => openSession(button.dataset.session);
+  });
+  if (filtered.length > 10) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'recent-more';
+    more.textContent = recentExpanded
+      ? tr('music.recent.showLess')
+      : tr('music.recent.showAll', {count: filtered.length});
+    more.onclick = () => {
+      recentExpanded = !recentExpanded;
+      renderRecentSessions(sessions);
+    };
+    list.appendChild(more);
+  }
+}
+
+async function refreshRecentSessions() {
+  const card = $m('recentCard');
+  if (!card) return;
+  try {
+    const response = await fetch('/v1/audio/music/sessions?limit=30');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const payload = await response.json();
+    recentSessionsCache = payload.sessions || [];
+    if (!recentSessionsCache.length) {
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = 'block';
+    renderRecentSessions(recentSessionsCache);
+  } catch (error) {
+    card.style.display = 'none';
+  }
+}
+
+async function openSession(session) {
+  if (!session) return;
+  await loadSession(session);
+  refreshRecentSessions();
 }
 
 function buildNotesByMeasure(pb) {
@@ -413,7 +922,9 @@ function syncScore() {
     const mid = (lo + hi) >> 1;
     if (measures[mid].start <= t) { m = mid; lo = mid + 1; } else hi = mid - 1;
   }
-  $m('measureLabel').textContent = 'Measure ' + (m + 1) + ' / ' + measures.length;
+  $m('measureLabel').textContent = tr('music.measure', {
+    page: m + 1, total: measures.length,
+  });
   if (pageInfo && pageInfo.length) {
     for (let i = 0; i < pageInfo.length; i++) {
       const range = pageInfo[i].measures;
@@ -473,7 +984,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const audio = $m('songAudio');
   if (!audio || audio._syncBound) return;
   audio._syncBound = true;
-  $m('songPlayBtn').onclick = () => { if (audio.paused) audio.play(); else audio.pause(); };
+  $m('songPlayBtn').onclick = () => {
+    if (audio.paused) {
+      audio.play().catch(err => {
+        musicShowError('Audio playback failed: ' + err.message);
+      });
+    } else {
+      audio.pause();
+    }
+  };
   audio.addEventListener('timeupdate', syncScore);
   audio.addEventListener('seeked', syncScore);
   audio.addEventListener('play', () => { $m('songPlayBtn').innerHTML = '&#10074;&#10074;'; });
@@ -524,13 +1043,14 @@ function resetForFile(file) {
   selectedFile = file;
   uploadedId = null;
   audioDuration = 0;
-  out.textContent = file ? 'Audio selected. Choose Upload or live WebRTC transcription.' : 'Waiting for audio…';
+  out.textContent = file ? tr('asr.audioSelected') : tr('asr.waiting');
+  out.dataset.empty = '1';
   setProgress(uploadBar, 0);
-  uploadLabel.textContent = 'Upload';
-  uploadStatus.textContent = file ? 'Selected' : 'Idle';
+  uploadLabel.textContent = tr('common.upload');
+  uploadStatus.textContent = file ? tr('music.status.selected') : tr('common.idle');
   setProgress(asrBar, 0);
-  asrLabel.textContent = 'Transcribing';
-  asrStatus.textContent = 'Idle';
+  asrLabel.textContent = tr('asr.transcribeLabel');
+  asrStatus.textContent = tr('common.idle');
   setButtons();
 }
 
@@ -552,8 +1072,9 @@ function loadDuration(file) {
 
 function appendTranscript(text) {
   if (!text) return;
-  if (out.textContent.startsWith('Waiting for audio') || out.textContent.startsWith('Audio selected')) {
+  if (out.dataset.empty === '1') {
     out.textContent = '';
+    out.dataset.empty = '0';
   }
   out.appendChild(document.createTextNode(text));
   out.appendChild(document.createElement('br'));
@@ -561,16 +1082,19 @@ function appendTranscript(text) {
 
 function markTranscribed(wallSeconds, audioSeconds, processingSeconds, rtf) {
   setProgress(asrBar, 100);
-  asrLabel.textContent = 'Transcribed';
+  asrLabel.textContent = tr('asr.transcribed');
   const processing = processingSeconds !== undefined
-    ? `Server ${seconds(processingSeconds)}`
+    ? tr('asr.serverTime', {seconds: seconds(processingSeconds)})
     : null;
   const rtfText = (rtf !== undefined && Number.isFinite(Number(rtf)))
     ? `RTF ${Number(rtf).toFixed(5)}`
     : null;
-  asrStatus.textContent = `Completed in ${seconds(wallSeconds)}`;
+  asrStatus.textContent = tr('asr.completedIn', {
+    seconds: seconds(wallSeconds),
+  });
   if (audioSeconds !== undefined) {
-    asrStatus.textContent += ` / Audio ${seconds(audioSeconds)}`;
+    asrStatus.textContent += ' / ' +
+      tr('asr.audioTime', {seconds: seconds(audioSeconds)});
   }
   if (processing) {
     asrStatus.textContent += ` / ${processing}`;
@@ -631,22 +1155,25 @@ function uploadWithProgress() {
       if (!ev.lengthComputable) return;
       const percent = 100 * ev.loaded / ev.total;
       setProgress(uploadBar, percent);
-      uploadStatus.textContent = `Uploading ${Math.round(percent)}%`;
+      uploadStatus.textContent =
+        tr('asr.uploadingPct', {pct: Math.round(percent)});
       logState(`Upload progress: ${Math.round(percent)}%`);
     };
     xhr.onload = () => {
       const elapsed = (performance.now() - startedAt) / 1000;
       if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
         setProgress(uploadBar, 100);
-        uploadLabel.textContent = 'Upload';
-        uploadStatus.textContent = `Uploaded in ${seconds(elapsed)}`;
+        uploadLabel.textContent = tr('common.upload');
+        uploadStatus.textContent = tr('asr.uploadedIn',
+          {seconds: seconds(elapsed)});
         logState(`Upload complete in ${seconds(elapsed)}: id=${xhr.response.id}, path=${xhr.response.audio_path}`);
         resolve(xhr.response);
       } else {
         reject(new Error(xhr.response && xhr.response.detail ? xhr.response.detail : `Upload failed (HTTP ${xhr.status})`));
       }
     };
-    xhr.onerror = () => reject(new Error('Upload network error'));
+    xhr.onerror = () => reject(
+      new Error(tr('music.status.uploadNetworkError')));
     xhr.send(form);
   });
 }
@@ -661,7 +1188,7 @@ uploadBtn.onclick = async () => {
     uploadedId = result.id;
   } catch (err) {
     setProgress(uploadBar, 0);
-    uploadStatus.textContent = 'Upload failed';
+    uploadStatus.textContent = tr('asr.uploadFailed');
     console.error(`[VeloxVoice] Upload error: ${err.message}`);
     alert(err.message);
   } finally {
@@ -693,8 +1220,8 @@ transcribeBtn.onclick = async () => {
   setButtons();
   out.textContent = '';
   setProgress(asrBar, 0);
-  asrLabel.textContent = 'Transcribing';
-  asrStatus.textContent = 'Starting';
+  asrLabel.textContent = tr('asr.transcribeLabel');
+  asrStatus.textContent = tr('asr.starting');
   logState('Post-upload transcription started');
   const startedAt = performance.now();
   const form = new FormData();
@@ -731,8 +1258,8 @@ transcribeBtn.onclick = async () => {
     });
   } catch (err) {
     setProgress(asrBar, 0);
-    asrLabel.textContent = 'Transcribing';
-    asrStatus.textContent = 'Failed';
+    asrLabel.textContent = tr('asr.transcribeLabel');
+    asrStatus.textContent = tr('asr.failed');
     out.textContent = `Error: ${err.message}`;
     console.error(`[VeloxVoice] Transcription error: ${err.message}`);
   } finally {
@@ -747,11 +1274,11 @@ webrtcBtn.onclick = async () => {
   setButtons();
   out.textContent = '';
   setProgress(uploadBar, 0);
-  uploadLabel.textContent = 'Upload';
-  uploadStatus.textContent = 'Connecting';
+  uploadLabel.textContent = tr('common.upload');
+  uploadStatus.textContent = tr('asr.connecting');
   setProgress(asrBar, 0);
-  asrLabel.textContent = 'Transcribing';
-  asrStatus.textContent = 'Starting';
+  asrLabel.textContent = tr('asr.transcribeLabel');
+  asrStatus.textContent = tr('asr.starting');
   const liveStart = performance.now();
   let uploadStart = performance.now();
   logState('Live WebRTC transcription started');
@@ -762,7 +1289,7 @@ webrtcBtn.onclick = async () => {
       ws.onopen = () => {
         logState('Live streaming connection opened');
         uploadStart = performance.now();
-        uploadStatus.textContent = 'Uploading';
+        uploadStatus.textContent = tr('asr.uploading');
         ws.send(JSON.stringify({
           type: 'start',
           pool_seconds: Number(poolSel.value),
@@ -773,8 +1300,8 @@ webrtcBtn.onclick = async () => {
         resolve();
       };
       ws.onerror = () => {
-        uploadStatus.textContent = 'Failed';
-        asrStatus.textContent = 'Failed';
+        uploadStatus.textContent = tr('asr.failed');
+        asrStatus.textContent = tr('asr.failed');
         console.error('[VeloxVoice] Live streaming connection error');
         reject(new Error('Live streaming connection failed'));
       };
@@ -809,8 +1336,8 @@ webrtcBtn.onclick = async () => {
     } else if (obj.type === 'error') {
       out.textContent = `Error: ${obj.detail}`;
       setProgress(asrBar, 0);
-      asrLabel.textContent = 'Transcribing';
-      asrStatus.textContent = 'Failed';
+      asrLabel.textContent = tr('asr.transcribeLabel');
+      asrStatus.textContent = tr('asr.failed');
       console.error(`[VeloxVoice] Live transcription error: ${obj.detail}`);
     }
   };
@@ -820,8 +1347,8 @@ webrtcBtn.onclick = async () => {
     setButtons();
   };
   ws.onerror = () => {
-    uploadStatus.textContent = 'Failed';
-    asrStatus.textContent = 'Failed';
+    uploadStatus.textContent = tr('asr.failed');
+    asrStatus.textContent = tr('asr.failed');
     console.error('[VeloxVoice] Live streaming connection error');
   };
 
@@ -834,7 +1361,8 @@ webrtcBtn.onclick = async () => {
       offset += buf.byteLength;
       const percent = 100 * offset / selectedFile.size;
       setProgress(uploadBar, percent);
-      uploadStatus.textContent = `Uploading ${Math.round(percent)}%`;
+      uploadStatus.textContent =
+        tr('asr.uploadingPct', {pct: Math.round(percent)});
       logState(`Live upload progress: ${Math.round(percent)}%`);
     }
     if (ws.readyState === 1) {
@@ -847,6 +1375,65 @@ webrtcBtn.onclick = async () => {
     console.error(`[VeloxVoice] Live upload error: ${err.message}`);
   }
 };
+
+// ── lane availability + ASR confirmation modal ──
+let asrAvailable = null, musicAvailable = null;
+const _showTab = showTab;
+showTab = function(t) {
+  if (t === 'asr' && asrAvailable === false) {
+    openAsrModal();
+    return;
+  }
+  _showTab(t);
+};
+function openAsrModal() {
+  document.getElementById('asrModal').style.display = 'flex';
+  document.getElementById('asrConfirm').checked = false;
+  document.getElementById('asrOk').disabled = true;
+}
+function closeAsrModal() {
+  document.getElementById('asrModal').style.display = 'none';
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const checkbox = document.getElementById('asrConfirm');
+  const ok = document.getElementById('asrOk');
+  checkbox.onchange = () => { ok.disabled = !checkbox.checked; };
+  document.getElementById('asrCancel').onclick = closeAsrModal;
+  ok.onclick = () => {
+    if (!checkbox.checked) return;
+    closeAsrModal();
+    document.getElementById('tabAsr').classList.add('confirmed');
+    const status = document.getElementById('asrStatus');
+    status.className = 'status info';
+    status.textContent = tr('asr.confirmed');
+  };
+});
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const requested = new URLSearchParams(location.search).get('tab');
+  if (requested === 'music') showTab('music');
+  else if (requested === 'asr') showTab('asr');
+  try {
+    const health = await (await fetch('/healthz')).json();
+    asrAvailable = !!health.asr;
+    musicAvailable = !!health.music;
+    // Do not hide or auto-switch lanes: keep ASR clickable so the user can
+    // explicitly request the ASR model via the confirmation modal.
+    if (requested === 'asr' && asrAvailable === false) openAsrModal();
+  } catch (err) {
+    console.warn('[VeloxVoice] healthz probe failed:', err);
+  }
+});
+
+// Reopen a previous transcription: /?tab=music&session=<id>
+document.addEventListener('DOMContentLoaded', async () => {
+  await i18nReady;
+  const session = new URLSearchParams(location.search).get('session');
+  if (session) {
+    showTab('music');
+    loadSession(session);
+  }
+});
 </script>
 
   </div><!-- end asrPanel -->
@@ -854,48 +1441,70 @@ webrtcBtn.onclick = async () => {
   <div id="musicPanel" style="display:none">
     <div class="card">
       <div class="drop" id="musicDrop">
-        <b>Select song</b><br>
-        <small>MP3, WAV, FLAC, OGG — Vocal + Instrumental melody transcription</small>
+        <b data-i18n="music.selectSong">Select song</b><br>
+        <small data-i18n="music.formats">MP3, WAV, FLAC, OGG — Vocal + Instrumental melody transcription</small>
       </div>
       <input type="file" id="musicFile" accept=".mp3,.wav,.flac,.ogg,.m4a" />
       <div class="actions">
-        <button id="musicUploadBtn" disabled>Upload</button>
-        <button id="musicTranscribeBtn" disabled>Transcribe (after uploading)</button>
+        <button id="musicUploadBtn" disabled data-i18n="music.uploadBtn">Upload</button>
+        <button id="musicTranscribeBtn" disabled data-i18n="music.transcribeBtn">Transcribe (after uploading)</button>
+      </div>
+      <div class="engine-row">
+        <label for="musicEngine" data-i18n="music.engine">转谱引擎</label>
+        <select id="musicEngine">
+          <option value="piano">Piano A/B</option>
+          <option value="sheetsage" selected>SheetSage2</option>
+        </select>
+      </div>
+      <div class="session-id" id="sessionIdRow" style="display:none">
+        <span data-i18n="music.session">Session</span>
+        <code id="currentSessionId"></code>
+        <button type="button" id="copySession" class="secondary" data-i18n="music.copy">Copy</button>
+        <a id="sessionPermalink" class="meta" target="_blank"
+           rel="noopener" data-i18n="music.bookmark">Bookmark</a>
+      </div>
+      <div class="lyrics-upload">
+        <button type="button" id="musicLrcBtn" class="secondary" data-i18n="music.uploadLrc">Upload timed lyrics (.lrc)</button>
+        <input type="file" id="musicLrcFile" accept=".lrc,text/plain" />
+        <span id="musicLrcStatus" class="meta"></span>
       </div>
 
       <div class="progress"><div id="musicUploadBar"></div></div>
-      <div class="progress-label"><span id="musicUploadLabel">Upload</span><span id="musicUploadStatus">Idle</span></div>
+      <div class="progress-label"><span id="musicUploadLabel" data-i18n="music.uploadLabel">Upload</span><span id="musicUploadStatus" data-i18n="music.idle">Idle</span></div>
 
       <div class="progress"><div id="musicDecodeBar"></div></div>
-      <div class="progress-label"><span id="musicDecodeLabel">Transcribing</span><span id="musicDecodeStatus">Idle</span></div>
+      <div class="progress-label"><span id="musicDecodeLabel" data-i18n="music.transcribeLabel">Transcribing</span><span id="musicDecodeStatus" data-i18n="music.idle">Idle</span></div>
 
       <div class="status" id="musicStatus" style="display:none"></div>
       <div class="timing" id="musicTiming" style="display:none">
         <table>
-          <tr><td>Wall time</td><td id="tWall">&mdash;</td></tr>
-          <tr><td>Audio duration</td><td id="tAudio">&mdash;</td></tr>
-          <tr><td>RTF</td><td id="tRtf">&mdash;</td></tr>
-          <tr><td>Tokens generated</td><td id="tTokens">&mdash;</td></tr>
-          <tr><td>Windows processed</td><td id="tWindows">&mdash;</td></tr>
-          <tr><td>Events detected</td><td id="tEvents">&mdash;</td></tr>
+          <tr><td data-i18n="music.wallTime">Wall time</td><td id="tWall">&mdash;</td></tr>
+          <tr><td data-i18n="music.audioDuration">Audio duration</td><td id="tAudio">&mdash;</td></tr>
+          <tr><td data-i18n="music.rtf">RTF</td><td id="tRtf">&mdash;</td></tr>
+          <tr><td data-i18n="music.tokens">Tokens generated</td><td id="tTokens">&mdash;</td></tr>
+          <tr><td data-i18n="music.windows">Windows processed</td><td id="tWindows">&mdash;</td></tr>
+          <tr><td data-i18n="music.events">Events detected</td><td id="tEvents">&mdash;</td></tr>
         </table>
       </div>
     </div>
     <div class="card" id="scoreCard" style="display:none">
-      <h3 style="font-size:16px;margin-bottom:8px">&#127925; Lead Sheet &mdash; Vocal + Instrumental</h3>
+      <h3 id="scoreTitle" style="font-size:16px;margin-bottom:8px" data-i18n="music.leadSheet">&#127925; Lead Sheet &mdash; Vocal + Instrumental</h3>
       <div id="songPlayer" style="display:none;align-items:center;gap:10px;margin-top:8px">
         <button type="button" id="songPlayBtn" style="width:40px;height:40px;border-radius:50%;border:none;background:#10a37f;color:#fff;font-size:16px;cursor:pointer;flex:none">&#9654;</button>
-        <audio id="songAudio" controls style="flex:1;height:36px"></audio>
+        <audio id="songAudio" controls preload="auto" style="flex:1;height:36px"></audio>
         <span id="measureLabel" style="font-size:13px;color:#666;flex:none;min-width:110px;text-align:right"></span>
       </div>
       <div class="score-viewer" id="scoreViewer"></div>
       <div class="score-nav" id="scoreNav" style="display:none">
-        <button type="button" onclick="prevPage(event)" id="prevBtn">&larr; Prev</button>
+        <button type="button" onclick="prevPage(event)" id="prevBtn" data-i18n="music.prev">&larr; Prev</button>
         <span id="pageLabel">Page 1 / N</span>
-        <button type="button" onclick="nextPage(event)" id="nextBtn">Next &rarr;</button>
+        <button type="button" onclick="nextPage(event)" id="nextBtn" data-i18n="music.next">Next &rarr;</button>
       </div>
+      <div class="lyrics-timeline" id="lyricsTimeline" style="display:none"></div>
+      <div id="lyricsSource" class="meta"
+           style="display:none;text-align:center;margin-top:4px"></div>
       <div class="abc-view" id="abcView" style="display:none">
-        <details><summary style="cursor:pointer;color:#10a37f">ABC notation</summary>
+        <details><summary style="cursor:pointer;color:#10a37f" data-i18n="music.abcNotation">ABC notation</summary>
           <pre id="abcText"></pre></details>
       </div>
       <div class="dl" id="pianoRow" style="margin-top:10px"></div>
@@ -904,11 +1513,36 @@ webrtcBtn.onclick = async () => {
         <div class="dl" id="pianoInsRow"></div>
       </div>
       <div class="dl" id="midiRow" style="margin-top:6px"></div>
+      <div class="dl" id="stemRow" style="display:none;margin-top:6px"></div>
+    </div>
+    <div class="card" id="recentCard" style="display:none">
+      <div class="recent-head">
+        <h3 data-i18n="music.recentTitle">Recent music sessions</h3>
+        <button type="button" id="recentRefresh" class="secondary" data-i18n="music.refresh">&#8635; Refresh</button>
+      </div>
+      <input id="recentFilter" class="recent-filter" type="search"
+             data-i18n-placeholder="music.filterPlaceholder" placeholder="Filter by title or session id (e.g. 5d5c35abdd63)" />
+      <div class="recent-list" id="recentList"></div>
     </div>
     <div class="card" id="lyricsCard" style="display:none">
-      <h3 style="font-size:16px;margin-bottom:8px">&#127769; Lyrics <span style="font-size:12px;color:#888;font-weight:normal">(ASR on separated vocal stem &mdash; best effort)</span></h3>
+      <h3 style="font-size:16px;margin-bottom:8px">&#127769; <span data-i18n="music.lyricsTitle">Lyrics</span> <span style="font-size:12px;color:#888;font-weight:normal" data-i18n="music.lyricsSubtitle">(ASR on separated vocal stem — best effort)</span></h3>
       <div class="status info" id="lyricsStatus" style="display:block"></div>
       <pre id="lyricsText" style="margin-top:8px;background:#f8f8f8;border:1px solid #ddd;border-radius:6px;padding:10px;font-size:13px;line-height:1.6;white-space:pre-wrap;max-height:260px;overflow:auto"></pre>
+    </div>
+  </div>
+
+  <div id="asrModal" class="modal" style="display:none">
+    <div class="modal-card">
+      <h3 data-i18n="asr.modalTitle">ASR 模型未启动</h3>
+      <p data-i18n="asr.modalBody">当前服务只加载了音乐模型。使用 ASR 需要启动 WeNet ASR 模型。</p>
+      <label class="check">
+        <input type="checkbox" id="asrConfirm" />
+        <span data-i18n="asr.modalConfirm">我已确认需要启动 ASR 模型</span>
+      </label>
+      <div class="modal-actions">
+        <button type="button" id="asrCancel" data-i18n="common.cancel">取消</button>
+        <button type="button" id="asrOk" disabled data-i18n="common.confirm">确认</button>
+      </div>
     </div>
   </div>
 
@@ -920,6 +1554,60 @@ webrtcBtn.onclick = async () => {
     #musicPanel .status.info { color: #10a37f; }
     #musicPanel .status.ok { color: #059669; }
     #musicPanel .status.err { color: #dc2626; }
+    #musicPanel .secondary { background:#eef2f7; color:#334155; }
+    #musicPanel .lyrics-upload { display:flex; align-items:center; gap:8px;
+      margin-top:10px; flex-wrap:wrap; }
+    #musicPanel .lyrics-upload input[type=file] { display:none; }
+    #musicPanel .engine-row { display:flex; align-items:center; gap:8px;
+      margin-top:10px; flex-wrap:wrap; }
+    #musicPanel .engine-row label { color:#475569; font-size:13px; font-weight:600; }
+    #musicPanel .engine-row select { padding:7px 10px; border-radius:8px;
+      border:1px solid #cbd5e1; background:#fff; color:#0f172a; }
+    #musicPanel .meta { color:#666; font-size:12px; }
+    #musicPanel .session-id { display:flex; align-items:center; gap:8px;
+      margin-top:10px; font-size:12px; color:#475569; flex-wrap:wrap; }
+    #musicPanel .session-id code { background:#f1f5f9; padding:2px 7px;
+      border-radius:4px; color:#0f172a; font-size:12px; }
+    #musicPanel .session-id button { padding:3px 9px; font-size:12px; }
+    #musicPanel .recent-head { display:flex; align-items:center;
+      justify-content:space-between; gap:8px; margin-bottom:8px; }
+    #musicPanel .recent-head h3 { margin:0; font-size:16px; }
+    #musicPanel .recent-head button { background:#f0f0f0; color:#333;
+      border:1px solid #ccc; padding:4px 10px; border-radius:6px;
+      cursor:pointer; font-size:12px; }
+    #musicPanel .recent-filter { width:100%; box-sizing:border-box;
+      margin-bottom:8px; padding:7px 10px; border:1px solid #cbd5e1;
+      border-radius:7px; font-size:12px; color:#0f172a; background:#fff; }
+    #musicPanel .recent-list { display:grid; gap:6px; }
+    #musicPanel .recent-item { display:flex; flex-direction:column;
+      align-items:flex-start; gap:2px; text-align:left; width:100%;
+      background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;
+      padding:8px 10px; cursor:pointer; }
+    #musicPanel .recent-item:hover { border-color:#0ea5e9; background:#f0f9ff; }
+    #musicPanel .recent-item.active { border-color:#0ea5e9;
+      box-shadow:0 0 0 1px #0ea5e9 inset; }
+    #musicPanel .recent-title { font-size:13px; font-weight:700; color:#0f172a; }
+    #musicPanel .recent-meta { font-size:11px; color:#64748b; }
+    #musicPanel .recent-more { background:#eef2f7; color:#334155;
+      border:1px solid #cbd5e1; border-radius:8px; padding:6px 10px;
+      font-size:12px; cursor:pointer; }
+    #musicPanel .progress > div.timed { background-image:
+      linear-gradient(90deg,#10a37f,#34d399,#10a37f);
+      background-size:200% 100%; animation: music-shimmer 1.2s linear infinite; }
+    @keyframes music-shimmer { 0% { background-position:100% 0; }
+      100% { background-position:-100% 0; } }
+    .modal { position:fixed; inset:0; background:rgba(15,23,42,.45);
+      display:none; align-items:center; justify-content:center; z-index:50; }
+    .modal-card { background:#fff; color:#111; border-radius:12px; padding:22px;
+      width:min(440px,90vw); box-shadow:0 20px 50px rgba(0,0,0,.25); }
+    .modal-card h3 { margin:0 0 8px; font-size:18px; }
+    .modal-card p { margin:0 0 12px; color:#475569; font-size:14px; }
+    .modal-card .check { display:flex; gap:8px; align-items:center; font-size:14px; }
+    .modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:18px; }
+    .modal-actions button { background:#e2e8f0; color:#0f172a; }
+    .modal-actions button#asrOk { background:#0ea5e9; color:#fff; }
+    .modal-actions button:disabled { opacity:.45; }
+    #tabAsr.confirmed::after { content:' ✓'; color:#0ea5e9; font-weight:800; }
     #musicPanel .timing { margin-top: 8px; font-size: 13px; color: #555; }
     #musicPanel .timing td { padding: 2px 10px; }
     #musicPanel .score-viewer { margin-top: 12px; text-align: center;
@@ -927,14 +1615,32 @@ webrtcBtn.onclick = async () => {
       border: 1px solid #ddd; border-radius: 8px; overflow: auto;
       height: 70vh; background: #fff; }
     #musicPanel .score-viewer svg { width: 100%; height: auto; display: block; }
+    #musicPanel .score-viewer.staff-embed { height: auto; overflow: visible;
+      padding: 0; border: 1px solid #dbe2ea; background: #fff; text-align: left; }
+    #musicPanel .score-viewer.staff-embed iframe { display: block; width: 100%;
+      height: 560px; border: 0; background: #fff; }
     #musicPanel .score-viewer svg [data-on="1"],
     #musicPanel .score-viewer svg [data-on="1"] * {
-      fill: #dc2626 !important; stroke: #dc2626 !important; }
+      fill: #38bdf8 !important; stroke: #0284c7 !important;
+      filter: drop-shadow(0 2px 1px rgba(2,132,199,.75))
+              drop-shadow(0 0 6px rgba(56,189,248,.65)); }
     #musicPanel #noteMarker { position: absolute; width: 0; height: 0;
       border-top: 7px solid transparent; border-bottom: 7px solid transparent;
-      border-left: 11px solid #dc2626; filter: drop-shadow(0 0 3px #dc2626);
+      border-left: 11px solid #0ea5e9;
+      filter: drop-shadow(0 0 6px #38bdf8) drop-shadow(0 2px 1px #0369a1);
       display: none; pointer-events: none; z-index: 5;
       transition: left 70ms linear, top 70ms linear; }
+    #musicPanel .lyrics-timeline { margin: 14px auto 2px; max-width: 780px;
+      text-align: center; line-height: 1.75; }
+    #musicPanel .lyric-line { display: block; color: #94a3b8; font-size: 15px;
+      transition: color .18s ease, transform .18s ease, font-size .18s ease; }
+    #musicPanel .lyric-line.past { color: #cbd5e1; }
+    #musicPanel .lyric-line.active {
+      color: #e0f2fe; font-weight: 800; font-size: 17px;
+      text-shadow: 0 1px 0 #7dd3fc, 0 2px 0 #38bdf8, 0 3px 0 #0ea5e9,
+                   0 4px 0 #0284c7, 0 5px 0 #0369a1,
+                   0 7px 12px rgba(2,132,199,.6), 0 0 22px rgba(56,189,248,.7);
+      transform: translateY(-2px) scale(1.01); }
     #musicPanel .score-nav { display: flex; justify-content: center; align-items: center;
       gap: 12px; margin-top: 10px; }
     #musicPanel .score-nav button { background: #f0f0f0; color: #333; border: 1px solid #ccc;
