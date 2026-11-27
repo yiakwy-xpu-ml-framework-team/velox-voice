@@ -15,6 +15,10 @@ datasets
 jiwer
 matplotlib
 
+# music
+pretty_midi
+mir_eval
+
 # --- optional benchmark extras ---
 # torchaudio            # mel filterbank reference in tests/benchmarks
 # librosa               # resampling reference

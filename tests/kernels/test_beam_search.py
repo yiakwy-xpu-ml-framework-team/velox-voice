@@ -14,6 +14,7 @@ import torch
 from veloxvoice.kernels.ops.cuda_ops import beam_search
 from veloxvoice.stream.rescore import AttRescorer, ctc_prefix_beam_search
 
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 

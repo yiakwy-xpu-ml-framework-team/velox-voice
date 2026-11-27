@@ -1,0 +1,26 @@
+{
+  "production_graph_step_us": 791.079,
+  "speedup_vs_production": 2.629,
+  "old_kernel": "sheetsage_ar_persistent (single-block, sheetsage_ar_block.h)",
+  "new_kernel": "multi-kernel CUDA graph (step_pipeline.py: K1 flashinfer, K2/K3 ss_* kernels)",
+  "old_step_us": 7783.68,
+  "new_step_us": 300.958,
+  "speedup": 25.863,
+  "new_group_us": {
+    "K1 (cross_attn)": 67.233,
+    "K2 (fused gemv)": 120.959,
+    "K3 (self-attn)": 38.623,
+    "other": 38.688
+  },
+  "old_stage_us": {
+    "embed": 0.96,
+    "qkv_gemv+kvstore": 460.448,
+    "self_attn": 92.192,
+    "self_out+ln+xq": 304.32,
+    "cross_attn": 4354.432,
+    "cross_out+ln+ffn1": 967.296,
+    "gelu+ffn2+ln": 291.072,
+    "lm_head": 1311.488,
+    "argmax+fsm": 1.472
+  }
+}
